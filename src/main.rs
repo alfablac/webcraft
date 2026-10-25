@@ -9,8 +9,8 @@ mod icons;
 mod theme;
 mod ui;
 use downloadcraft_lib::{
-    applog, debrid, dl_history, engine, grabber, model, nntp, platform, queue, scheduler, stream,
-    torrent, ytdlp,
+    applog, debrid, dl_history, engine, grabber, mega, model, nntp, platform, queue, scheduler,
+    stream, torrent, ytdlp,
 };
 use model::*;
 use std::collections::HashMap;
@@ -247,6 +247,33 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                 "queue" => t.queue_id = v.trim().to_string(),
                 "size" => t.total = v.trim().parse::<u64>().ok().filter(|n| *n > 0),
                 "mime" => t.mime = v.trim().to_string(),
+                // Native host flattens safe browser request headers as
+                // header.<Name>=<value>; stored on the task as-is (minus
+                // prefix). Pseudo-header names are task config, never
+                // browser headers, so they are skipped here (engine would
+                // strip them anyway; keeps task state clean).
+                k if k.starts_with("header.") => {
+                    let name = &k["header.".len()..];
+                    let name = name.trim();
+                    let v = v.trim();
+                    let pseudo = crate::ytdlp::YT_HEADER_KEYS
+                        .iter()
+                        .any(|x| name.eq_ignore_ascii_case(x))
+                        || [
+                            "x-page-url",
+                            "x-page-title",
+                            "x-page-stream",
+                            "x-page-intent",
+                            "x-rep-id",
+                            "x-variant-index",
+                            "x-nzb",
+                        ]
+                        .iter()
+                        .any(|x| name.eq_ignore_ascii_case(x));
+                    if !name.is_empty() && !v.is_empty() && !pseudo {
+                        t.headers.insert(name.to_string(), v.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -669,7 +696,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                     // page URL (+referrer/cookies), NOT a capture task.
                     let _ = std::fs::write(
                         platform::config_dir().join("pending-add.json"),
-                        serde_json::json!({"url": url_decode(enc), "referrer": t.referrer, "cookies": t.cookies}).to_string(),
+                        serde_json::json!({"url": url_decode(enc), "referrer": t.referrer, "cookies": t.cookies, "cookiesJson": t.cookies_json}).to_string(),
                     );
                     let _ = std::fs::remove_file(&p);
                     continue;

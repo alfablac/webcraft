@@ -2,6 +2,37 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.25.0] - 2026-10-24
+
+### Added
+
+- MEGA folder links: pasting a public folder URL enumerates its files
+  via the MEGA API (no account needed) and creates one download task
+  per file, each resolved through debrid or downloaded directly.
+- Real-Debrid folder unrestrict (`POST /unrestrict/folder`) for MEGA
+  folders, fixing `hoster_unsupported` errors on folder links that
+  work on the Real-Debrid website.
+- NZB health check: missing articles (NNTP 430/423/424) count
+  immediately with no retries; a download aborts early with a
+  user-visible error once 20% or more of checked articles (64+
+  sample) are missing, and final errors report the missing share.
+- Multi-server Usenet: configure extra NNTP provider servers; the
+  total connection pool is split across all enabled servers.
+- Options > General: in-app activity log panel.
+- Saved proxy list: name and save proxies in Options, then pick one
+  per download in Add URL/File or the browser capture dialog.
+- Browser captures forward the browser's request headers
+  (User-Agent, Accept-Language, Authorization when sent) alongside
+  cookies, so UA/session-gated downloads keep working.
+
+### Fixed
+
+- Doubled `Real-Debrid: Real-Debrid:` prefix in debrid errors.
+- NZB downloads stuck at 0.0% with no error: connect, article and
+  stall timeouts now fail loudly.
+- Browser cookies could be silently overwritten by a `Cookie` header
+  row; the Cookies/Referrer fields now take precedence.
+
 ## [0.24.0] - 2026-10-23
 
 ### Added

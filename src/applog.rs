@@ -2,6 +2,8 @@
 //! `platform::config_dir()/logs` (`app-YYYY-MM-DD.jsonl`).
 //! Caller wires module with `pub mod applog;` in `src/lib.rs`.
 //! Secrets redacted before write; messages capped at 1000 chars.
+//! `append` also pushes into a bounded in-memory ring (`snapshot`/`clear`,
+//! last `MAX_MEM_ENTRIES` since process start) for the Options Activity Log.
 //! Retention: log files older than 90 days deleted by `prune`; logs and
 //! the sibling `dl-history` dir share a 50 MiB disk budget, enforced by
 //! deleting oldest-day files first across both dirs.
@@ -18,6 +20,8 @@ pub const MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 pub const RETENTION_DAYS: u64 = 90;
 /// Message cap (chars, char-boundary safe) applied in `append`.
 pub const MAX_MSG_CHARS: usize = 1000;
+/// In-memory ring capacity (session entries kept for the UI log).
+pub const MAX_MEM_ENTRIES: usize = 500;
 
 pub const LV_INFO: &str = "INFO";
 pub const LV_WARN: &str = "WARN";
@@ -166,9 +170,48 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+// ------------------------------------------------------------- mem ring
+
+fn mem_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<LogRecord>> {
+    static RING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<LogRecord>>,
+    > = std::sync::OnceLock::new();
+    RING.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(MAX_MEM_ENTRIES))
+    })
+}
+
+/// Push into the in-memory ring, dropping oldest beyond `MAX_MEM_ENTRIES`.
+/// Poison-tolerant, never panics.
+fn mem_push(rec: LogRecord) {
+    if let Ok(mut q) = mem_ring().lock() {
+        if q.len() >= MAX_MEM_ENTRIES {
+            q.pop_front();
+        }
+        q.push_back(rec);
+    }
+}
+
+/// Snapshot of the in-memory ring, oldest first / newest last (at most
+/// `MAX_MEM_ENTRIES`). Clones the bounded buffer only; safe per frame.
+pub fn snapshot() -> Vec<LogRecord> {
+    mem_ring()
+        .lock()
+        .map(|q| q.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Clear the in-memory ring (persistent JSONL files untouched).
+pub fn clear() {
+    if let Ok(mut q) = mem_ring().lock() {
+        q.clear();
+    }
+}
+
 // ---------------------------------------------------------------- append
 
-/// Append one redacted JSON line to `dir/app-<today>.jsonl`.
+/// Append one redacted JSON line to `dir/app-<today>.jsonl` and push the
+/// same (redacted, capped) record into the in-memory ring.
 /// Creates `dir` as needed. Never panics; I/O errors ignored.
 pub fn append(dir: &Path, level: &str, cat: &str, msg: &str) {
     let rec = LogRecord {
@@ -177,6 +220,7 @@ pub fn append(dir: &Path, level: &str, cat: &str, msg: &str) {
         cat: cat.to_string(),
         msg: redact(msg).chars().take(MAX_MSG_CHARS).collect(),
     };
+    mem_push(rec.clone());
     let _ = std::fs::create_dir_all(dir);
     let Ok(line) = serde_json::to_string(&rec) else {
         return;
@@ -757,5 +801,44 @@ mod tests {
         prune(&tmp("nope-a"), &tmp("nope-b"), now);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&hist);
+    }
+
+    #[test]
+    fn mem_ring_bounded_redacted_snapshot_and_clear() {
+        // Global ring shared with parallel tests: assert on our own tail
+        // entries (found by scan), not exact total length.
+        clear();
+        let dir = tmp("memring");
+        append(&dir, LV_INFO, "app", "hello token=leakme");
+        append(&dir, LV_ERROR, "download", "boom");
+        let snap = snapshot();
+        let hello = snap
+            .iter()
+            .find(|r| r.msg.starts_with("hello"))
+            .expect("own entry present");
+        assert_eq!(hello.msg, "hello token=***");
+        assert!(!hello.msg.contains("leakme"));
+        assert_eq!(hello.level, LV_INFO);
+        assert!(hello.ts_ms > 0);
+        let boom = snap
+            .iter()
+            .find(|r| r.msg == "boom")
+            .expect("own error entry present");
+        assert_eq!(boom.level, LV_ERROR);
+        // Bounded: overflow drops oldest, newest entries retained.
+        for i in 0..(MAX_MEM_ENTRIES + 5) {
+            append(&dir, LV_DEBUG, "flood", &format!("m{i}"));
+        }
+        let snap = snapshot();
+        assert!(snap.len() <= MAX_MEM_ENTRIES);
+        let newest = format!("m{}", MAX_MEM_ENTRIES + 4);
+        assert!(snap.iter().any(|r| r.msg == newest), "newest flood entry kept");
+        assert!(!snap.iter().any(|r| r.msg == "m0"), "oldest flood entry dropped");
+        clear();
+        assert!(
+            !snapshot().iter().any(|r| r.msg == newest),
+            "clear removes our entries"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

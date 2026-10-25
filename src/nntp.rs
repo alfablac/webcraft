@@ -448,21 +448,38 @@ pub struct NntpConfig {
     /// Auto-unpack rar/zip/7z in out dir after successful download
     /// (Settings.nzb_auto_unpack). Archive deleted only on verified success.
     pub auto_unpack: bool,
+    /// All enabled servers with their share of `connections` (pool
+    /// construction only; empty = fall back to the primary fields above).
+    /// Workers are spawned per endpoint, so article jobs from the shared
+    /// queue are pulled by connections on every server and a 430/failure
+    /// on one server does not stop workers on the others.
+    pub endpoints: Vec<(crate::model::NntpServer, u32)>,
 }
 
 impl NntpConfig {
-    /// Global server settings; per-task username/password override when set.
+    /// Global server settings; per-task username/password override when set
+    /// (override applies to the primary server only; extras keep their own).
     pub fn from_settings(s: &Settings, task: &DownloadTask) -> Self {
+        let total = if task.segments > 0 {
+            task.segments
+        } else {
+            s.nntp_connections
+        }
+        .clamp(1, 64);
+        let mut endpoints = s.nntp_server_endpoints(total);
+        if let Some((primary, _)) = endpoints.first_mut() {
+            if !task.username.is_empty() {
+                primary.user = task.username.clone();
+            }
+            if !task.password.is_empty() {
+                primary.pass = task.password.clone();
+            }
+        }
         Self {
             host: s.nntp_host.clone(),
             port: s.nntp_port,
             tls: s.nntp_tls,
-            connections: if task.segments > 0 {
-                task.segments
-            } else {
-                s.nntp_connections
-            }
-            .clamp(1, 64),
+            connections: total,
             auto_unpack: s.nzb_auto_unpack,
             user: if task.username.is_empty() {
                 s.nntp_user.clone()
@@ -474,6 +491,22 @@ impl NntpConfig {
             } else {
                 task.password.clone()
             },
+            endpoints,
+        }
+    }
+
+    /// Per-endpoint single-server config for `Nntp::connect` (its own
+    /// credentials; `connections` = this endpoint's share).
+    fn for_endpoint(&self, srv: &crate::model::NntpServer, count: u32) -> Self {
+        Self {
+            host: srv.host.clone(),
+            port: srv.port,
+            tls: srv.tls,
+            user: srv.user.clone(),
+            pass: srv.pass.clone(),
+            connections: count,
+            auto_unpack: self.auto_unpack,
+            endpoints: Vec::new(),
         }
     }
 }
@@ -543,9 +576,13 @@ impl Nntp {
                 return Err("invalid NNTP host/credential".into());
             }
         }
-        let tcp = tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port))
-            .await
-            .map_err(|e| format!("NNTP connect {}:{}: {e}", cfg.host, cfg.port))?;
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)),
+        )
+        .await
+        .map_err(|_| format!("NNTP connect {}:{} timed out", cfg.host, cfg.port))?
+        .map_err(|e| format!("NNTP connect {}:{}: {e}", cfg.host, cfg.port))?;
         let wire = if cfg.tls {
             use tokio_rustls::rustls;
             let mut roots = rustls::RootCertStore::empty();
@@ -677,8 +714,8 @@ impl Nntp {
         Ok(())
     }
 
-    /// BODY <msgid>: 222 + dot-terminated body. 430 = article gone (no
-    /// PAR2 in v1, so caller treats it as fatal for the file).
+    /// BODY <msgid>: 222 + dot-terminated body. 430 = article gone;
+    /// caller counts it missing (PAR2 repair may still save the file).
     async fn body(&mut self, msgid: &str, ctrl: &Controls) -> Result<Vec<u8>, String> {
         if msgid.contains(['\r', '\n']) {
             return Err("invalid NZB message-id".into());
@@ -689,10 +726,9 @@ impl Nntp {
             format!("<{msgid}>")
         };
         let (code, text) = self.cmd(&format!("BODY {id}")).await?;
-        if code == 430 {
-            return Err(format!(
-                "NNTP article {id} missing (430); PAR2 repair not in v1"
-            ));
+        if code == 430 || code == 423 || code == 424 {
+            // Stable marker parsed by `is_missing_article_error`.
+            return Err(format!("NNTP article {id} missing ({code}): no such article"));
         }
         if code != 222 {
             return Err(format!("NNTP BODY {id} -> {text}"));
@@ -745,6 +781,248 @@ async fn fetch_nzb_text(client: &reqwest::Client, task: &DownloadTask) -> Result
 pub async fn probe_nzb(client: reqwest::Client, task: &DownloadTask) -> Result<Nzb, String> {
     let xml = fetch_nzb_text(&client, task).await?;
     parse_nzb(&xml)
+}
+
+// ---------- Missing-article accounting & retry policy (pure) ----------
+
+/// Per-article attempts (initial try + retries) for transient errors
+/// before an article is declared failed. Missing-article errors
+/// (430-class) are definitive and never retried (see
+/// `article_failure_action`), so this bounds only non-missing retries.
+pub const ARTICLE_ATTEMPTS: u32 = 3;
+/// Whole connect (TCP + TLS + greeting + auth) deadline.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// One article fetch (GROUP + BODY) deadline; a silent-but-open
+/// connection must not wedge a worker forever.
+pub const ARTICLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Coordinator no-progress deadline: workers guarantee one result
+/// per job, so silence this long means a wedged pool — fail loudly.
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// Progressive NZB health check: once at least this many articles have
+/// been checked, a missing share of >= 20% (1 in 5) aborts the whole
+/// download early instead of grinding to the end (user policy: an NZB
+/// with 20% of its articles gone is unusable).
+pub const HEALTH_MIN_SAMPLE: u64 = 64;
+
+/// Progressive NZB health check (pure). Returns `Some(user-facing
+/// abort message)` when the NZB is already provably unusable:
+/// `checked` (ok + missing outcomes so far) has reached
+/// `HEALTH_MIN_SAMPLE`, `checked < total` (not at the end yet — the
+/// final incomplete summary handles that case), and at least 20% of
+/// the checked articles are missing (integer math: missing * 5 >=
+/// checked, missing > 0). Message carries the observed percentage and
+/// counts so it reads clearly in the task error.
+pub fn health_abort(missing: u64, checked: u64, total: u64) -> Option<String> {
+    if checked < HEALTH_MIN_SAMPLE || checked >= total || missing == 0 {
+        return None;
+    }
+    if missing * 5 >= checked {
+        let pct = missing * 100 / checked;
+        Some(format!(
+            "NZB unusable: {pct}% of articles missing ({missing}/{checked} checked so far) — aborting"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Ok/missing article counts for one file (folded for the NZB total).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArticleTally {
+    pub ok: u64,
+    pub missing: u64,
+}
+
+impl ArticleTally {
+    pub fn record_ok(&mut self) {
+        self.ok += 1;
+    }
+    pub fn record_missing(&mut self) {
+        self.missing += 1;
+    }
+    pub fn total(&self) -> u64 {
+        self.ok + self.missing
+    }
+    pub fn is_complete(&self) -> bool {
+        self.missing == 0
+    }
+}
+
+/// True when an article-fetch error means "article not on server"
+/// (NNTP 430, also 423/424 article-number variants / text form),
+/// as opposed to a transient failure worth retrying. Matches the
+/// stable markers emitted by `Nntp::body`, never bare digits that
+/// could appear in a message-id or byte count.
+pub fn is_missing_article_error(e: &str) -> bool {
+    let l = e.to_ascii_lowercase();
+    l.contains("no such article")
+        || l.contains("(430)")
+        || l.contains("-> 430")
+        || l.contains("-> 423")
+        || l.contains("-> 424")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArticleAction {
+    Missing,
+    Retry,
+    Fail,
+}
+
+/// Article fetch failure policy: missing-article errors
+/// (430/423/424) count Missing on the FIRST attempt — NNTP
+/// availability is definitive, so a 430 means the article is gone and
+/// repeated checks will not find it (deliberate user policy: "no need
+/// to keep checking if the article appears, nntp is very direct
+/// according availability"). Transient non-missing errors retry up to
+/// `max_attempts`, then fail the download; cancel never retries.
+fn article_failure_action(e: &str, _attempt: u32, max_attempts: u32) -> ArticleAction {
+    if e == "cancelled" {
+        return ArticleAction::Fail;
+    }
+    if is_missing_article_error(e) {
+        return ArticleAction::Missing;
+    }
+    if _attempt >= max_attempts.max(1) {
+        ArticleAction::Fail
+    } else {
+        ArticleAction::Retry
+    }
+}
+
+/// Headline for an NZB that cannot complete: `"NZB incomplete:
+/// X/Y articles missing (P%)"` (X missing of Y total, P = integer
+/// missing percentage, 0 when total is 0).
+pub fn incomplete_summary(missing: u64, total: u64) -> String {
+    let pct = missing.checked_mul(100).and_then(|m| m.checked_div(total)).unwrap_or(0);
+    format!("NZB incomplete: {missing}/{total} articles missing ({pct}%)")
+}
+
+/// Monotonic ms since first use (stall deadlines; immune to wall
+/// clock jumps).
+fn now_mono_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// True when `last_ms` is at least `window` in the past.
+fn deadline_hit(last_ms: u64, window: std::time::Duration) -> bool {
+    last_ms != 0
+        && now_mono_ms().saturating_sub(last_ms) >= window.as_millis() as u64
+}
+
+/// Per-article outcome in the worker pool (module scope so the
+/// fetch helper and the `download_nzb` coordinator share it).
+#[derive(Debug)]
+enum SegOut {
+    Ok(Vec<u8>),
+    Missing,
+    Err(String),
+}
+
+/// Fetch one article with bounded retries (see `ARTICLE_ATTEMPTS`/
+/// `ARTICLE_TIMEOUT`/`CONNECT_TIMEOUT`). Every failure drops the
+/// connection (it may be desynced); missing-article errors
+/// (430-class) count Missing immediately — no retries, NNTP
+/// availability is definitive. `first_job` preserves the
+/// pre-existing contract: the very first article's exhausted connect
+/// failure aborts the whole download instead of failing one file.
+/// Total latency is bounded by attempts x (connect + article
+/// timeouts), and the shared `last_result_at` stall breaker ends the
+/// pool.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_article_with_retry(
+    conn: &mut Option<Nntp>,
+    cfg: &NntpConfig,
+    group: &str,
+    seg: &NzbSegment,
+    ctrl: &Controls,
+    last_result_at: &std::sync::atomic::AtomicU64,
+    first_job: bool,
+) -> SegOut {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        if deadline_hit(
+            last_result_at.load(Ordering::Relaxed),
+            STALL_TIMEOUT,
+        ) {
+            return SegOut::Err(format!(
+                "NNTP stalled: no articles completed in {}s",
+                STALL_TIMEOUT.as_secs()
+            ));
+        }
+        if conn.is_none() {
+            match tokio::time::timeout(CONNECT_TIMEOUT, Nntp::connect(cfg)).await {
+                Ok(Ok(c)) => *conn = Some(c),
+                Ok(Err(e)) => {
+                    if first_job && attempt >= ARTICLE_ATTEMPTS {
+                        return SegOut::Err(e);
+                    }
+                    match article_failure_action(&e, attempt, ARTICLE_ATTEMPTS) {
+                        ArticleAction::Missing => {
+                            last_result_at.store(now_mono_ms(), Ordering::Relaxed);
+                            return SegOut::Missing;
+                        }
+                        ArticleAction::Retry => continue,
+                        ArticleAction::Fail => return SegOut::Err(e),
+                    }
+                }
+                Err(_) => {
+                    let e = format!("NNTP connect to {} timed out", cfg.host);
+                    if attempt >= ARTICLE_ATTEMPTS {
+                        return SegOut::Err(e);
+                    }
+                    continue;
+                }
+            }
+        }
+        let c = conn.as_mut().expect("conn just ensured");
+        let fetched = tokio::time::timeout(ARTICLE_TIMEOUT, async {
+            c.ensure_group(group).await?;
+            c.body(&seg.id, ctrl).await
+        })
+        .await;
+        match fetched {
+            Ok(Ok(b)) => {
+                last_result_at.store(now_mono_ms(), Ordering::Relaxed);
+                return SegOut::Ok(b);
+            }
+            Ok(Err(e)) => {
+                if e == "cancelled" {
+                    return SegOut::Err(e);
+                }
+                *conn = None;
+                match article_failure_action(&e, attempt, ARTICLE_ATTEMPTS) {
+                    ArticleAction::Missing => {
+                        last_result_at.store(now_mono_ms(), Ordering::Relaxed);
+                        return SegOut::Missing;
+                    }
+                    ArticleAction::Retry => {}
+                    ArticleAction::Fail => return SegOut::Err(e),
+                }
+            }
+            Err(_) => {
+                *conn = None;
+                let e = format!(
+                    "NNTP article <{}> timed out after {}s",
+                    seg.id,
+                    ARTICLE_TIMEOUT.as_secs()
+                );
+                match article_failure_action(&e, attempt, ARTICLE_ATTEMPTS) {
+                    ArticleAction::Missing => {
+                        last_result_at.store(now_mono_ms(), Ordering::Relaxed);
+                        return SegOut::Missing;
+                    }
+                    ArticleAction::Retry => {}
+                    ArticleAction::Fail => return SegOut::Err(e),
+                }
+            }
+        }
+    }
 }
 
 /// Download an NZB task: fetch/parse NZB, then per file fetch segments in
@@ -805,11 +1083,6 @@ pub async fn download_nzb(
     // per-file NZB order; files finalize independently (sidecar on complete,
     // 430-fail isolated). ponytail: fetched-but-unwritten segments buffer in
     // RAM (~2*N channel + pending); spool to part files if huge NZBs matter.
-    enum SegOut {
-        Ok(Vec<u8>),
-        Missing,
-        Err(String),
-    }
     struct FileSt {
         out: Option<tokio::fs::File>,
         dest: std::path::PathBuf,
@@ -825,6 +1098,12 @@ pub async fn download_nzb(
     }
     let mut downloaded: u64 = 0;
     let mut segs_done: u64 = 0;
+    // Per-file article accounting (missing counted on the first
+    // definitive 430-class answer, no retries; ok on written
+    // segments); folded NZB-wide it drives both the progressive
+    // health abort (`health_abort`) and the final "NZB incomplete:
+    // X/Y articles missing (P%)" failure.
+    let mut tallies: Vec<ArticleTally> = nzb.files.iter().map(|_| ArticleTally::default()).collect();
     let mut failed: Vec<(usize, String)> = Vec::new();
     let mut states: Vec<Option<FileSt>> = Vec::new();
     let mut groups: Vec<String> = Vec::new();
@@ -850,6 +1129,7 @@ pub async fn download_nzb(
         if let Some(b) = skip {
             downloaded += b;
             segs_done += file.segments.len() as u64;
+            tallies[file_idx].ok = file.segments.len() as u64;
             if multi {
                 if let Some(p) = ctrl
                     .parts
@@ -937,7 +1217,29 @@ pub async fn download_nzb(
                 q.extend(jobs.iter().copied());
             }
         }
-        let nworkers = (cfg.connections as usize).clamp(1, total_jobs);
+        // Combined pool: one worker group per enabled server, sized by
+        // its share of cfg.connections (model::divide_connections). All
+        // groups pull from the same shared queue (work-stealing), so an
+        // article missing/failing on one server leaves other servers'
+        // workers unaffected. Fallback (directly built cfg): primary only.
+        let endpoints: Vec<NntpConfig> = if cfg.endpoints.is_empty() {
+            if cfg.host.trim().is_empty() {
+                return Err(
+                    "no Usenet server configured/enabled (NNTP not configured; Options > Connection > NNTP)".into(),
+                );
+            }
+            vec![cfg.clone()]
+        } else {
+            cfg.endpoints
+                .iter()
+                .map(|(srv, c)| cfg.for_endpoint(srv, *c))
+                .collect()
+        };
+        let nworkers: usize = endpoints
+            .iter()
+            .map(|e| (e.connections as usize).clamp(1, total_jobs))
+            .sum::<usize>()
+            .clamp(1, total_jobs);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, usize, SegOut)>(nworkers * 2);
         let segs_all = std::sync::Arc::new(
             nzb.files
@@ -946,9 +1248,14 @@ pub async fn download_nzb(
                 .collect::<Vec<_>>(),
         );
         let groups_a = std::sync::Arc::new(groups.clone());
+        // Pool progress clock (mono ms): workers stamp every article
+        // outcome; the stall breaker in fetch_article_with_retry and
+        // the coordinator no-progress deadlines read it.
+        let last_result_at = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_mono_ms()));
         let mut handles = Vec::new();
-        for _ in 0..nworkers {
-            let (tx, queue, pool_done, dead, segs_all, groups_a, wctrl, wcfg) = (
+        for ecfg in endpoints {
+            for _ in 0..(ecfg.connections as usize).clamp(1, total_jobs) {
+            let (tx, queue, pool_done, dead, segs_all, groups_a, wctrl, wcfg, last_result_at) = (
                 tx.clone(),
                 queue.clone(),
                 pool_done.clone(),
@@ -956,7 +1263,8 @@ pub async fn download_nzb(
                 segs_all.clone(),
                 groups_a.clone(),
                 ctrl.clone(),
-                cfg.clone(),
+                ecfg.clone(),
+                last_result_at.clone(),
             );
             handles.push(tokio::spawn(async move {
                 let mut conn: Option<Nntp> = None;
@@ -975,38 +1283,21 @@ pub async fn download_nzb(
                     if dead[fi].load(Ordering::Relaxed) {
                         continue;
                     }
-                    if conn.is_none() {
-                        match Nntp::connect(&wcfg).await {
-                            Ok(c) => conn = Some(c),
-                            Err(e) => {
-                                let _ = tx.send((usize::MAX, usize::MAX, SegOut::Err(e))).await;
-                                return;
-                            }
-                        }
-                    }
+                    // Connection (with connect timeout) happens inside
+                    // fetch_article_with_retry; initial-connect failure
+                    // is reported as a per-file Err by the coordinator
+                    // instead of silently returning here.
                     let seg = &segs_all[fi][si];
-                    let mut attempt = 0;
-                    let out = loop {
-                        attempt += 1;
-                        let c = conn.as_mut().expect("conn alive");
-                        let r = async {
-                            c.ensure_group(&groups_a[fi]).await?;
-                            c.body(&seg.id, &wctrl).await
-                        }
-                        .await;
-                        match r {
-                            Ok(b) => break SegOut::Ok(b),
-                            Err(e) if attempt == 1 && !e.contains("430") && e != "cancelled" => {
-                                conn = None;
-                                match Nntp::connect(&wcfg).await {
-                                    Ok(c) => conn = Some(c),
-                                    Err(e) => break SegOut::Err(e),
-                                }
-                            }
-                            Err(e) if e.contains("430") => break SegOut::Missing,
-                            Err(e) => break SegOut::Err(e),
-                        }
-                    };
+                    let out = fetch_article_with_retry(
+                        &mut conn,
+                        &wcfg,
+                        &groups_a[fi],
+                        seg,
+                        &wctrl,
+                        &last_result_at,
+                        fi == 0 && si == 0,
+                    )
+                    .await;
                     let fatal = matches!(out, SegOut::Err(_));
                     if tx.send((fi, si, out)).await.is_err() || fatal {
                         return;
@@ -1016,23 +1307,87 @@ pub async fn download_nzb(
                     let _ = c.cmd("QUIT").await;
                 }
             }));
+            }
         }
         drop(tx);
         let mut fatal: Option<String> = None;
+        // Coordinator no-progress clock: declared results also count
+        // (ko-progress). Workers bound every job, so a full
+        // STALL_TIMEOUT of silence = wedged pool -> fail loudly
+        // instead of the old indefinite rx.recv() 0.0% stall.
+        let mut coord_last_progress = now_mono_ms();
         loop {
             let remaining = states.iter().flatten().filter(|st| !st.done).count();
             if remaining == 0 {
                 break;
             }
-            let Some((fi, si, out)) = rx.recv().await else {
-                fatal = Some("segment workers stopped".into());
+            // Pause semantics identical to workers' wait_not_paused:
+            // keep waiting, never treat pause as a stall.
+            if let Err(e) = crate::engine::wait_not_paused(&ctrl).await {
+                pool_done.store(true, Ordering::Relaxed);
+                for h in &handles {
+                    h.abort();
+                }
+                if e == "cancelled" {
+                    return paused(task, downloaded, e);
+                }
+                fatal = Some(e);
                 break;
+            }
+            let recv = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                rx.recv(),
+            )
+            .await;
+            let (fi, si, out) = match recv {
+                Ok(Some(m)) => {
+                    coord_last_progress = now_mono_ms();
+                    m
+                }
+                Ok(None) => {
+                    fatal = Some("segment workers stopped".into());
+                    break;
+                }
+                Err(_) => {
+                    if ctrl.paused.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if deadline_hit(coord_last_progress, STALL_TIMEOUT) {
+                        fatal = Some(format!(
+                            "NNTP stalled: no articles completed in {}s",
+                            STALL_TIMEOUT.as_secs()
+                        ));
+                        break;
+                    }
+                    continue;
+                }
             };
             if fi == usize::MAX {
                 if let SegOut::Err(e) = out {
                     fatal = Some(e);
                 }
                 break;
+            }
+            // ---- Progressive NZB health check ----
+            // Once >=64 sampled articles are >=20% missing the NZB is
+            // unusable: stop the pool instead of grinding to the end.
+            // This deliberately aborts before PAR2 repair is considered
+            // (user policy — at that loss rate repair cannot save it).
+            // NZB-wide aggregation: tallies for every file count
+            // sidecar-skipped files as ok (set before the pool starts),
+            // and already-written pending results are in tallies; any
+            // just-buffered pending ones catch the check next message.
+            {
+                let agg_missing: u64 = tallies.iter().map(|t| t.missing).sum();
+                let agg_checked: u64 = tallies.iter().map(|t| t.total()).sum();
+                if let Some(msg) = health_abort(agg_missing, agg_checked, total_segs) {
+                    crate::applog::append_default(crate::applog::LV_ERROR, "nntp", &msg);
+                    pool_done.store(true, Ordering::Relaxed);
+                    for h in &handles {
+                        h.abort();
+                    }
+                    return Err(msg);
+                }
             }
             {
                 let file = &nzb.files[fi];
@@ -1062,6 +1417,9 @@ pub async fn download_nzb(
                             // best-effort and flag offset (PAR2 rebuilds
                             // shifted/missing blocks, or verify fails).
                             st.missing += 1;
+                            tallies[fi].record_missing();
+                            // Partial results still advance the NZB.
+                            coord_last_progress = now_mono_ms();
                             st.pending_hole = true;
                         }
                         SegOut::Err(e) => {
@@ -1141,6 +1499,8 @@ pub async fn download_nzb(
                             st.written += part.data.len() as u64;
                             downloaded += part.data.len() as u64;
                             segs_done += 1;
+                            tallies[fi].record_ok();
+                            coord_last_progress = now_mono_ms();
                             ctrl.downloaded.store(downloaded, Ordering::Relaxed);
                             if multi {
                                 if let Some(p) = ctrl
@@ -1181,7 +1541,23 @@ pub async fn download_nzb(
                         o.flush().await.map_err(|e| e.to_string())?;
                         drop(o);
                     }
-                    failed.push((fi, format!("{} (missing segment(s), 430)", file.name)));
+                    crate::applog::append_default(
+                        crate::applog::LV_WARN,
+                        "nntp",
+                        &format!(
+                            "NZB file '{}': {}/{} articles missing (430)",
+                            file.name,
+                            tallies[fi].missing,
+                            nzb.files[fi].segments.len()
+                        ),
+                    );
+                    failed.push((
+                        fi,
+                        format!(
+                            "{} ({} articles missing, 430)",
+                            file.name, tallies[fi].missing
+                        ),
+                    ));
                     st.done = true;
                 }
                 if !st.done && st.next_write >= file.segments.len() {
@@ -1315,21 +1691,50 @@ pub async fn download_nzb(
             }
         }
     }
+    // NZB-level missing totals across every file (recorded even for
+    // files PAR2 could not save; skipped/complete files count ok).
+    let total_missing: u64 = tallies.iter().map(|t| t.missing).sum();
+    let total_articles: u64 = tallies.iter().map(|t| t.total()).sum();
     if !failed.is_empty() {
-        let mut msg = format!(
-            "NZB: {} file(s) failed: {}",
-            failed.len(),
-            failed
-                .iter()
-                .map(|(_, s)| s.clone())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+        let mut msg = if total_missing > 0 {
+            format!(
+                "{}; {} file(s) incomplete: {}",
+                incomplete_summary(total_missing, total_articles),
+                failed.len(),
+                failed
+                    .iter()
+                    .map(|(_, s)| s.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        } else {
+            format!(
+                "NZB: {} file(s) failed: {}",
+                failed.len(),
+                failed
+                    .iter()
+                    .map(|(_, s)| s.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         if let Some(n) = repair_note {
             msg.push_str("; ");
             msg.push_str(&n);
         }
+        crate::applog::append_default(crate::applog::LV_ERROR, "nntp", &msg);
         return Err(msg);
+    }
+    if total_missing > 0 {
+        // Only reachable when PAR2 repaired every damaged file.
+        crate::applog::append_default(
+            crate::applog::LV_INFO,
+            "nntp",
+            &format!(
+                "{}; recovered via PAR2 repair",
+                incomplete_summary(total_missing, total_articles)
+            ),
+        );
     }
     // Auto-unpack after PAR2 repair, before Complete: extraction failure
     // returns Err (archive kept, app marks Error/retry, never Complete).
@@ -1582,6 +1987,162 @@ mod tests {
             nzb_password(&mixed, "https://x/r.nzb").as_deref(),
             Some("realpw")
         );
+    }
+
+    #[test]
+    fn missing_article_classification() {
+        assert!(is_missing_article_error(
+            "NNTP article <a@b> missing (430): no such article"
+        ));
+        assert!(is_missing_article_error(
+            "NNTP article <a@b> missing (423): no such article"
+        ));
+        assert!(is_missing_article_error("NNTP BODY <a@b> -> 430 No Such Article"));
+        assert!(is_missing_article_error("NNTP BODY <a@b> -> 424 Bad Article Number"));
+        // Not missing: message-id digits, byte counts, transient errors.
+        assert!(!is_missing_article_error("NNTP connect h:563: timed out"));
+        assert!(!is_missing_article_error(
+            "NNTP article <430bytes@x> timed out after 120s"
+        ));
+        assert!(!is_missing_article_error("yEnc size mismatch: got 430 want 100"));
+        assert!(!is_missing_article_error("cancelled"));
+        assert!(!is_missing_article_error(""));
+    }
+
+    #[test]
+    fn article_first_430_counts_missing_no_retries() {
+        let missing_err = "NNTP article <a@b> missing (430): no such article";
+        // Definitive on the FIRST attempt — NNTP availability is direct,
+        // no reason to re-check a 430/423/424 (user policy).
+        assert_eq!(
+            article_failure_action(missing_err, 1, ARTICLE_ATTEMPTS),
+            ArticleAction::Missing
+        );
+        assert_eq!(
+            article_failure_action(missing_err, 2, ARTICLE_ATTEMPTS),
+            ArticleAction::Missing
+        );
+        assert_eq!(
+            article_failure_action(missing_err, 3, ARTICLE_ATTEMPTS),
+            ArticleAction::Missing
+        );
+        assert_eq!(
+            article_failure_action(missing_err, 99, ARTICLE_ATTEMPTS),
+            ArticleAction::Missing
+        );
+        // Non-missing: retry then hard fail (never silently missing).
+        assert_eq!(
+            article_failure_action("connection reset", 1, ARTICLE_ATTEMPTS),
+            ArticleAction::Retry
+        );
+        assert_eq!(
+            article_failure_action("connection reset", 3, ARTICLE_ATTEMPTS),
+            ArticleAction::Fail
+        );
+        // Cancel never retries and never counts missing.
+        assert_eq!(
+            article_failure_action("cancelled", 1, ARTICLE_ATTEMPTS),
+            ArticleAction::Fail
+        );
+        assert_eq!(
+            article_failure_action("cancelled", 3, ARTICLE_ATTEMPTS),
+            ArticleAction::Fail
+        );
+        // Degenerate max_attempts still terminates on attempt 1.
+        assert_eq!(
+            article_failure_action(missing_err, 1, 0),
+            ArticleAction::Missing
+        );
+        assert_eq!(
+            article_failure_action("boom", 1, 1),
+            ArticleAction::Fail
+        );
+    }
+
+    #[test]
+    fn article_tally_and_incomplete_summary() {
+        let mut t = ArticleTally::default();
+        assert!(t.is_complete());
+        assert_eq!(t.total(), 0);
+        t.record_ok();
+        t.record_ok();
+        t.record_missing();
+        assert_eq!(t.ok, 2);
+        assert_eq!(t.missing, 1);
+        assert_eq!(t.total(), 3);
+        assert!(!t.is_complete());
+        assert_eq!(
+            incomplete_summary(1, 3),
+            "NZB incomplete: 1/3 articles missing (33%)"
+        );
+        assert_eq!(
+            incomplete_summary(0, 5544),
+            "NZB incomplete: 0/5544 articles missing (0%)"
+        );
+        assert_eq!(
+            incomplete_summary(1100, 5544),
+            "NZB incomplete: 1100/5544 articles missing (19%)"
+        );
+        assert_eq!(
+            incomplete_summary(0, 0),
+            "NZB incomplete: 0/0 articles missing (0%)"
+        );
+        // Fold across files (skipped + downloaded + damaged).
+        let tallies = [
+            ArticleTally { ok: 68, missing: 0 },
+            ArticleTally { ok: 60, missing: 8 },
+        ];
+        let missing: u64 = tallies.iter().map(|t| t.missing).sum();
+        let total: u64 = tallies.iter().map(|t| t.total()).sum();
+        assert_eq!(
+            incomplete_summary(missing, total),
+            "NZB incomplete: 8/136 articles missing (5%)"
+        );
+    }
+
+    #[test]
+    fn health_abort_threshold() {
+        // Below the 64-article sample: keep going (small NZBs handled by
+        // the final incomplete summary instead).
+        assert_eq!(health_abort(13, 63, 500), None, "13/63 is 20%+ but unsampled");
+        assert!(health_abort(100, 100, 101).is_some(), "100/100 missing, 1 left: abort");
+        // No losses at all.
+        assert_eq!(health_abort(0, 100, 1000), None);
+        // Below 20%: keep going (19/100 = 19%).
+        assert_eq!(health_abort(12, 64, 500), None, "12/64 = 18.75%");
+        assert_eq!(health_abort(19, 100, 1000), None, "19%");
+        // At exactly 20% (missing*5 == checked): abort.
+        assert_eq!(
+            health_abort(13, 64, 500).as_deref(),
+            Some("NZB unusable: 20% of articles missing (13/64 checked so far) — aborting")
+        );
+        assert!(health_abort(20, 100, 1000).is_some(), "exactly 20%");
+        // Sub-20 percent that rounds up via integer math still below:
+        // 19/96 = 19.79% -> missing*5=95 < 96, no abort.
+        assert_eq!(health_abort(19, 96, 1000), None);
+        // At the very end (checked == total): no early abort; the final
+        // "NZB incomplete" summary reports it (and PAR2 can still run).
+        assert_eq!(health_abort(50, 100, 100), None, "already complete");
+        assert_eq!(health_abort(200, 200, 200), None);
+        // Message shape: percentage is integer missing*100/checked.
+        assert_eq!(
+            health_abort(130, 520, 5544).as_deref(),
+            Some("NZB unusable: 25% of articles missing (130/520 checked so far) — aborting")
+        );
+    }
+
+    #[test]
+    fn stall_deadline_arithmetic() {
+        // 0 = never stamped: no stall (pool just started).
+        assert!(!deadline_hit(0, STALL_TIMEOUT));
+        // Just stamped: no stall.
+        assert!(!deadline_hit(now_mono_ms(), STALL_TIMEOUT));
+        // Stamped beyond the window: stall.
+        let old = now_mono_ms().saturating_sub(STALL_TIMEOUT.as_millis() as u64 + 60_000);
+        if old > 0 {
+            assert!(deadline_hit(old, STALL_TIMEOUT));
+        }
+        assert!(STALL_TIMEOUT > ARTICLE_TIMEOUT);
     }
 
     #[test]

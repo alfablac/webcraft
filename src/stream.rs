@@ -330,7 +330,14 @@ pub async fn download_url_with_settings(
             )
             .await
             {
-                Ok(t) => return Ok(t),
+                Ok(t) => {
+                    crate::applog::append_default(
+                        crate::applog::LV_INFO,
+                        "debrid",
+                        &format!("Debrid download finished: {}", t.filename),
+                    );
+                    return Ok(t);
+                }
                 Err((e, true)) => {
                     // Hard provider refusal (e.g. RD infringing_file,
                     // error 35): fail task with provider message.
@@ -341,6 +348,11 @@ pub async fn download_url_with_settings(
                 Err((_, false)) => {
                     // Soft: unsupported/no provider — fall through to
                     // local torrent / HTTP. Never log URL/token.
+                    crate::applog::append_default(
+                        crate::applog::LV_DEBUG,
+                        "debrid",
+                        "Debrid soft failure; falling back to local download",
+                    );
                 }
             }
         }
@@ -363,6 +375,11 @@ pub async fn download_url_with_settings(
             task.url = rest.to_string();
         }
         let cfg = crate::nntp::NntpConfig::from_settings(settings, &task);
+        crate::applog::append_default(
+            crate::applog::LV_INFO,
+            "nzb",
+            &format!("NZB download started: {}", task.filename),
+        );
         return crate::nntp::download_nzb(client, task, ctrl, &cfg).await;
     }
     if is_metalink_url(&task.url) {

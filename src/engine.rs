@@ -45,22 +45,15 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-/// Wire headers for HTTP(S) requests: referrer/cookies fields, then
-/// `task.headers` (invalid name/value dropped, pseudo-headers stripped),
-/// then Basic auth unless an Authorization header already present.
+/// Wire headers for HTTP(S) requests, in precedence order:
+/// (1) `task.headers` rows EXCLUDING Cookie/Referer (invalid name/value
+/// dropped, pseudo-headers stripped), (2) Referer from `task.referrer`,
+/// (3) Cookie from `task.cookies`. The referrer/cookies fields are the
+/// canonical browser/manual values, so they WIN over Cookie/Referer rows
+/// in `task.headers`. Then Basic auth unless Authorization already present.
 /// Single source for engine + stream fetches (FTP/SFTP ignore headers).
 pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
-    if !task.referrer.is_empty() {
-        if let Ok(v) = task.referrer.parse() {
-            h.insert(reqwest::header::REFERER, v);
-        }
-    }
-    if !task.cookies.is_empty() {
-        if let Ok(v) = task.cookies.parse() {
-            h.insert(reqwest::header::COOKIE, v);
-        }
-    }
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never sent on wire.
         if crate::ytdlp::YT_HEADER_KEYS
@@ -76,8 +69,22 @@ pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
         {
             continue;
         }
+        // Cookie/Referer rows lose to the dedicated fields applied below.
+        if k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("referer") {
+            continue;
+        }
         if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) {
             h.insert(n, vv);
+        }
+    }
+    if !task.referrer.is_empty() {
+        if let Ok(v) = task.referrer.parse() {
+            h.insert(reqwest::header::REFERER, v);
+        }
+    }
+    if !task.cookies.is_empty() {
+        if let Ok(v) = task.cookies.parse() {
+            h.insert(reqwest::header::COOKIE, v);
         }
     }
     if !task.username.is_empty() && !h.contains_key(reqwest::header::AUTHORIZATION) {
@@ -2977,6 +2984,40 @@ mod tests {
         ] {
             assert!(!h.contains_key(k), "pseudo-header leaked: {k}");
         }
+    }
+
+    #[test]
+    fn headers_for_cookies_field_beats_cookie_row() {
+        let mut t = task_with_headers(&[("Cookie", "row=1"), ("User-Agent", "UA/2")]);
+        t.cookies = "field=1".into();
+        let h = headers_for(&t);
+        assert_eq!(h["cookie"], "field=1");
+        assert_eq!(h["user-agent"], "UA/2");
+    }
+
+    #[test]
+    fn headers_for_referrer_field_beats_referer_row() {
+        let mut t = task_with_headers(&[("Referer", "https://row.example/")]);
+        t.referrer = "https://field.example/".into();
+        let h = headers_for(&t);
+        assert_eq!(h["referer"], "https://field.example/");
+    }
+
+    #[test]
+    fn headers_for_plain_rows_pass_through() {
+        let mut t = task_with_headers(&[
+            ("User-Agent", "UA/1"),
+            ("Accept-Language", "en-US"),
+            ("Authorization", "Bearer b"),
+        ]);
+        t.referrer = "https://ref.example/".into();
+        t.cookies = "a=b".into();
+        let h = headers_for(&t);
+        assert_eq!(h["user-agent"], "UA/1");
+        assert_eq!(h["accept-language"], "en-US");
+        assert_eq!(h["authorization"], "Bearer b");
+        assert_eq!(h["referer"], "https://ref.example/");
+        assert_eq!(h["cookie"], "a=b");
     }
     fn tmp_file(tag: &str, name: &str, bytes: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wc-validate-{}-{}", std::process::id(), tag));

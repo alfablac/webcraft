@@ -77,6 +77,41 @@ pub fn any_for_magnets(s: &Settings) -> bool {
         .any(|p| p.cfg(s).use_for_magnets)
 }
 
+/// Prefix `e` with `label:` unless it already carries that prefix
+/// (provider clients like RD/AD/TB self-prefix their error strings;
+/// double-prefixing confuses the user).
+fn prefixed(label: &str, e: &str) -> String {
+    if e.starts_with(&format!("{label}:")) {
+        e.to_string()
+    } else {
+        format!("{label}: {e}")
+    }
+}
+
+/// Pick this task's file from RD `/unrestrict/folder` entries: the picked
+/// file's handle appearing in the entry link wins, then exact filename,
+/// then a sole entry. `None` = no confident match; caller falls through.
+pub fn pick_rd_folder_link<'a>(
+    entries: &'a [crate::debrid_rd::RdFolderLink],
+    handle: &str,
+    name: &str,
+) -> Option<&'a crate::debrid_rd::RdFolderLink> {
+    if !handle.is_empty() {
+        if let Some(e) = entries.iter().find(|e| e.link.contains(handle)) {
+            return Some(e);
+        }
+    }
+    if !name.is_empty() {
+        if let Some(e) = entries.iter().find(|e| e.filename == name) {
+            return Some(e);
+        }
+    }
+    if entries.len() == 1 {
+        return entries.first();
+    }
+    None
+}
+
 /// Per-download providers allowed by `choice` (task `debrid_choice`):
 /// `"none"` -> none; `"rd"|"ad"|"tb"` -> just that provider when usable;
 /// anything else (`"auto"`) -> `enabled_providers`. Magnet/hoster
@@ -1175,7 +1210,7 @@ pub async fn resolve_hoster_result(
         match unrestrict(http.clone(), c.p, &cfg.api_key, url).await {
             Ok(f) => return (Ok((c.p, f)), false),
             Err(e) => {
-                let msg = format!("{}: {e}", c.p.label());
+                let msg = prefixed(c.p.label(), &e);
                 if hard.is_none() {
                     hard = Some(msg.clone());
                 }
@@ -1220,7 +1255,7 @@ pub async fn resolve_magnet_choice(
         match magnet_files(http.clone(), p, &cfg.api_key, magnet, cfg.cached_only).await {
             Ok(f) if !f.is_empty() => return Ok((p, f)),
             Ok(_) => last = format!("{}: no files", p.label()),
-            Err(e) => last = format!("{}: {e}", p.label()),
+            Err(e) => last = prefixed(p.label(), &e),
         }
     }
     if !tried {
@@ -1313,6 +1348,238 @@ pub async fn download_via_debrid(
         return Ok(done);
     }
     // hoster URL
+    // MEGA folder URLs: fan-out tasks (Add dialog) carry folder-selection
+    // per-file links (`/folder/<id>/file/<handle>`, fragment stripped at
+    // add time) in `task.url`; single-task adds carry the folder URL.
+    // Either way: list the folder, pick the task's file, then resolve
+    // THAT file. A URL fragment is a MEGA decryption secret and must
+    // never be sent to a provider API. Provider unrestrict of a
+    // folder/selection URL returns an arbitrary (first) file, so a
+    // provider result whose name differs from the picked file is a hard
+    // error — never download the wrong file. With no provider (choice
+    // "none" / none configured), download the node directly from MEGA
+    // and decrypt while streaming. All other errors are hard so the
+    // MEGA web page is never downloaded as a fake file.
+    if crate::mega::is_mega_folder_url(&original_url) {
+        let folder = match crate::mega::list_folder(http.clone(), &original_url).await {
+            Ok(f) => f,
+            Err(e) => return Err((format!("MEGA folder: {e}"), true)),
+        };
+        let picked = match folder.pick(&want_file) {
+            Some(f) => f.clone(),
+            None => {
+                return Err((format!(
+                    "MEGA folder has {} files but none named '{}'; re-add via Add dialog to fan out. Files: {}",
+                    folder.files.len(),
+                    want_file,
+                    folder
+                        .files
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ), true))
+            }
+        };
+        let provider_url = match picked.link.split('#').next() {
+            Some(u) => u.to_string(),
+            None => picked.link.clone(),
+        };
+        let mut provider_err: Option<String> = None;
+        // Real-Debrid first: RD rejects the fragment-less per-file
+        // selection link via /unrestrict/link (hoster_unsupported); its
+        // folder endpoint takes the canonical share link instead. The
+        // share link carries the MEGA key fragment: wire-only, never
+        // into errors or logs. Any folder-flow failure is soft: record
+        // it and fall through to the generic resolver / direct MEGA.
+        if choice != "none"
+            && providers_for(settings, choice).contains(&Provider::Rd)
+            && Provider::Rd.cfg(settings).use_for_hosters
+        {
+            let rd_cfg = Provider::Rd.cfg(settings);
+            'rd_folder: {
+                let Some(share_url) = crate::mega::folder_share_url(&original_url) else {
+                    break 'rd_folder;
+                };
+                let rd = crate::debrid_rd::RdClient::new(rd_cfg.api_key.clone(), http.clone());
+                let entry = match rd.unrestrict_folder(&share_url).await {
+                    Ok(entries) => match pick_rd_folder_link(&entries, &picked.handle, &picked.name)
+                    {
+                        Some(e) => e.clone(),
+                        None => {
+                            provider_err = Some(format!(
+                                "{}: MEGA folder link matched none of {} folder entries",
+                                Provider::Rd.label(),
+                                entries.len()
+                            ));
+                            break 'rd_folder;
+                        }
+                    },
+                    Err(e) => {
+                        provider_err = Some(prefixed(Provider::Rd.label(), &e));
+                        break 'rd_folder;
+                    }
+                };
+                // A hoster (MEGA) entry link still needs unrestricting;
+                // anything else is the resolved download URL already.
+                let resolved = if crate::debrid_rd::url_host(&entry.link)
+                    .is_some_and(|h| matches!(h.as_str(), "mega.nz" | "mega.co.nz" | "mega.io"))
+                {
+                    match unrestrict(
+                        http.clone(),
+                        Provider::Rd,
+                        &rd_cfg.api_key,
+                        &entry.link,
+                    )
+                    .await
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            provider_err = Some(prefixed(Provider::Rd.label(), &e));
+                            break 'rd_folder;
+                        }
+                    }
+                } else {
+                    ResolvedFile {
+                        name: if entry.filename.is_empty() {
+                            picked.name.clone()
+                        } else {
+                            entry.filename.clone()
+                        },
+                        size: None,
+                        url: entry.link.clone(),
+                        cached: None,
+                    }
+                };
+                let f = resolved;
+                let p = Provider::Rd;
+                if !f.name.is_empty() && f.name != picked.name {
+                    return Err((format!(
+                        "{}: MEGA folder link resolved to '{}' but this task is '{}'; provider folder handling picked the wrong file",
+                        p.label(),
+                        f.name,
+                        picked.name
+                    ), true));
+                }
+                let host = url_host(&original_url);
+                task.url = f.url.clone();
+                task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
+                if let Ok(mut l) = ctrl.live.lock() {
+                    *l = Some(crate::engine::LiveInfo {
+                        debrid_info: task.debrid_info.clone(),
+                        resolved_url: f.url.clone(),
+                        final_url: String::new(),
+                    });
+                }
+                let debrid_info = task.debrid_info.clone();
+                if !f.name.is_empty() {
+                    task.filename = crate::model::sanitize_filename(&f.name);
+                }
+                let resolved = f.url.clone();
+                let mut done = crate::engine::download_http_with_prewarm(
+                    http.clone(),
+                    task,
+                    ctrl.clone(),
+                    None,
+                    settings.max_part_mb * 1024 * 1024,
+                )
+                .await
+                .map_err(|e| (e, false))?;
+                done.url = original_url;
+                done.debrid_info = debrid_info;
+                done.debrided_url = resolved;
+                return Ok(done);
+            }
+        }
+        if choice != "none" {
+            match resolve_hoster_result(http.clone(), settings, &provider_url, choice).await {
+                (Ok((p, f)), _) => {
+                    if !f.name.is_empty() && f.name != picked.name {
+                        return Err((format!(
+                            "{}: MEGA folder link resolved to '{}' but this task is '{}'; provider folder handling picked the wrong file",
+                            p.label(),
+                            f.name,
+                            picked.name
+                        ), true));
+                    }
+                    let host = url_host(&original_url);
+                    task.url = f.url.clone();
+                    task.debrid_info = format_debrid_info(p.label(), &host, f.cached);
+                    if let Ok(mut l) = ctrl.live.lock() {
+                        *l = Some(crate::engine::LiveInfo {
+                            debrid_info: task.debrid_info.clone(),
+                            resolved_url: f.url.clone(),
+                            final_url: String::new(),
+                        });
+                    }
+                    let debrid_info = task.debrid_info.clone();
+                    if !f.name.is_empty() {
+                        task.filename = crate::model::sanitize_filename(&f.name);
+                    }
+                    let resolved = f.url.clone();
+                    let mut done = crate::engine::download_http_with_prewarm(
+                        http,
+                        task,
+                        ctrl,
+                        None,
+                        settings.max_part_mb * 1024 * 1024,
+                    )
+                    .await
+                    .map_err(|e| (e, false))?;
+                    done.url = original_url;
+                    done.debrid_info = debrid_info;
+                    done.debrided_url = resolved;
+                    return Ok(done);
+                }
+                (Err(e), _) => {
+                    provider_err = Some(match provider_err {
+                        Some(first) if first != e => format!("{first}; {e}"),
+                        _ => e,
+                    })
+                }
+            }
+        }
+        // Direct path: fetch the node's (encrypted) download URL and
+        // decrypt while streaming to disk.
+        let (dl_url, _sz) = match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = match provider_err {
+                    Some(pe) => format!("MEGA direct download failed: {e} (provider: {pe})"),
+                    None => format!("MEGA direct download failed: {e}"),
+                };
+                return Err((msg, true));
+            }
+        };
+        task.url = dl_url.clone();
+        task.debrid_info = format_debrid_info("MEGA direct", &url_host(&original_url), None);
+        if let Ok(mut l) = ctrl.live.lock() {
+            *l = Some(crate::engine::LiveInfo {
+                debrid_info: task.debrid_info.clone(),
+                resolved_url: dl_url.clone(),
+                final_url: String::new(),
+            });
+        }
+        let debrid_info = task.debrid_info.clone();
+        task.filename = crate::model::sanitize_filename(&picked.name);
+        let out_path = std::path::Path::new(&task.dest_dir).join(&task.filename);
+        let mut done = crate::engine::download_http_with_prewarm(
+            http,
+            task,
+            ctrl,
+            None,
+            settings.max_part_mb * 1024 * 1024,
+        )
+        .await
+        .map_err(|e| (e, false))?;
+        // Decrypt the completed (still-encrypted) file in place.
+        crate::mega::decrypt_file_in_place(&out_path, &picked.key)
+            .map_err(|e| (format!("MEGA decryption failed: {e}"), true))?;
+        done.url = original_url;
+        done.debrid_info = debrid_info;
+        done.debrided_url = dl_url;
+        return Ok(done);
+    }
     let (p, f) = match resolve_hoster_result(http.clone(), settings, &original_url, choice).await {
         (Ok(v), _) => v,
         (Err(e), hard) => return Err((e, hard)),
@@ -1381,6 +1648,56 @@ mod tests {
         assert!(any_for_magnets_choice(&s, "rd"));
         s.debrid_rd.use_for_magnets = false;
         assert!(!any_for_magnets_choice(&s, "rd"));
+    }
+
+    #[test]
+    fn prefixed_no_double_prefix() {
+        assert_eq!(
+            prefixed("Real-Debrid", "Real-Debrid: hoster_unsupported (error 16, HTTP 400)"),
+            "Real-Debrid: hoster_unsupported (error 16, HTTP 400)"
+        );
+        assert_eq!(
+            prefixed("Real-Debrid", "network request failed"),
+            "Real-Debrid: network request failed"
+        );
+        assert_eq!(
+            prefixed("AllDebrid", "AllDebrid: bad apikey"),
+            "AllDebrid: bad apikey"
+        );
+        // A different provider's prefix is not this label's: still prefix.
+        assert_eq!(
+            prefixed("Real-Debrid", "AllDebrid: oops"),
+            "Real-Debrid: AllDebrid: oops"
+        );
+    }
+
+    #[test]
+    fn pick_rd_folder_link_matching() {
+        let mk = |link: &str, filename: &str| crate::debrid_rd::RdFolderLink {
+            link: link.to_string(),
+            filename: filename.to_string(),
+        };
+        let entries = vec![
+            mk("https://download.real-debrid.com/d/A/a.rar", "a.rar"),
+            mk("https://mega.nz/folder/X/file/HANDLE2", "b.rar"),
+            mk("https://download.real-debrid.com/d/C/c.rar", "c.rar"),
+        ];
+        // Handle match wins even when names differ.
+        assert_eq!(
+            pick_rd_folder_link(&entries, "HANDLE2", "nope.rar").map(|e| e.filename.as_str()),
+            Some("b.rar")
+        );
+        // Filename match next.
+        assert_eq!(
+            pick_rd_folder_link(&entries, "MISSING", "c.rar").map(|e| e.link.as_str()),
+            Some("https://download.real-debrid.com/d/C/c.rar")
+        );
+        // No match with multiple entries -> None (caller falls through).
+        assert!(pick_rd_folder_link(&entries, "MISSING", "z.rar").is_none());
+        assert!(pick_rd_folder_link(&[], "H", "n.rar").is_none());
+        // Sole entry is the fallback.
+        let sole = vec![mk("https://download.real-debrid.com/d/A/a.rar", "")];
+        assert!(pick_rd_folder_link(&sole, "MISSING", "z.rar").is_some());
     }
 
     #[test]

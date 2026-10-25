@@ -334,6 +334,58 @@ async fn nntp_missing_article_430_errors() {
 }
 
 #[tokio::test]
+async fn nntp_health_abort_stops_unusable_nzb_early() {
+    // 200 segments, none on the server: after the 64-article sample is
+    // 100% missing the download must abort ("NZB unusable") instead of
+    // fetching all 200 (and without retrying any 430 — one BODY each).
+    let fake = fake_nntp(vec![]);
+    let segs: Vec<(&'static str, u64, u32)> = (0..200)
+        .map(|i| (Box::leak(format!("m{i}@news").into_boxed_str()) as &'static str, 100, i + 1))
+        .collect();
+    let nzb = nzb_xml(&[(
+        "poster &quot;gone.bin&quot;",
+        segs.iter().map(|(id, b, n)| (*id, *b, *n)).collect(),
+    )]);
+    let dir = tmpdir("health430");
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(&nzb_path, &nzb).unwrap();
+    let mut settings = settings_for(&fake);
+    settings.nntp_connections = 1;
+    let task = DownloadTask {
+        id: "nhealth".into(),
+        url: nzb_path.to_string_lossy().into_owned(),
+        filename: "x.nzb".into(),
+        dest_dir: dir.clone(),
+        ..Default::default()
+    };
+    let r = download_url_with_settings(
+        build_client(""),
+        task,
+        Arc::new(Controls::new(0)),
+        &settings,
+    )
+    .await;
+    let e = r.expect_err("unusable NZB must error");
+    assert!(e.contains("NZB unusable"), "{e}");
+    assert!(e.contains("100%"), "{e}");
+    // Early abort: far fewer than 200 BODYs (check fires at 64; a
+    // couple may be in flight), and no 430 was retried (still < 200
+    // total attempts even counting in-flight).
+    let bodies = fake
+        .cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("BODY "))
+        .count();
+    assert!(
+        (64..70).contains(&bodies),
+        "expected abort after ~64 BODYs, got {bodies}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn nntp_missing_file_fails_others_continue_resume_skips_done() {
     let data1: Vec<u8> = (0u32..600).map(|i| (i % 256) as u8).collect();
     let data2: Vec<u8> = (0u32..300).map(|i| (255 - (i % 256)) as u8).collect();

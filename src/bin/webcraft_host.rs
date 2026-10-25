@@ -468,7 +468,40 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                     }
                 }
             }
-            // headers object flattened as header lines are ignored by parser except known keys; store referrer/cookies above
+            // Safe browser request headers (extension allowlist) flatten to
+            // header.<Name>=<value> lines; desktop parse_kv_file stores them
+            // on the task and the engine sends them. cookie/host/content-
+            // length are never flattened: cookies travel via `cookies`, the
+            // rest are set by the HTTP stack. Sanitized: CR/LF would forge
+            // extra KV lines, so such pairs are dropped; count/value capped.
+            if let Some(hdrs) = msg.get("headers").and_then(|v| v.as_object()) {
+                let mut written = 0usize;
+                for (hn, hv) in hdrs {
+                    if written >= 8 {
+                        break;
+                    }
+                    let hv = match hv.as_str() {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let hn = hn.trim();
+                    let hv = hv.trim();
+                    if hn.is_empty()
+                        || hv.is_empty()
+                        || hn.len() > 64
+                        || hv.len() > 2048
+                        || hn.contains(['\r', '\n', '='])
+                        || hv.contains(['\r', '\n'])
+                        || hn.eq_ignore_ascii_case("cookie")
+                        || hn.eq_ignore_ascii_case("host")
+                        || hn.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    body.push_str(&format!("header.{hn}={hv}\n"));
+                    written += 1;
+                }
+            }
             match std::fs::write(dir.join(name), body) {
                 Ok(()) => {
                     // Inbox first, signal second: running app's watcher wakes

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "webcraft Integration Module",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Send downloads to webcraft desktop app",
   "browser_specific_settings": { "gecko": { "id": "downloadcraft@downloadcraft.local", "strict_min_version": "140.0", "data_collection_permissions": { "required": ["browsingActivity", "websiteContent"] } } },
   "background": { "scripts": ["rank.js", "background.js"], "persistent": true },

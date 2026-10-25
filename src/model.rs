@@ -288,6 +288,74 @@ pub fn resolve(preset_id: &str) -> &'static ButtonPreset {
         .unwrap_or_else(|| &button_presets()[1])
 }
 
+/// One extra Usenet provider server (beyond the primary `nntp_*` fields
+/// on `Settings`). Creds plain in state.json like the primary server.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NntpServer {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "def_nntp_port")]
+    pub port: u16,
+    #[serde(default = "def_true")]
+    pub tls: bool,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pass: String,
+    #[serde(default = "def_true")]
+    pub enabled: bool,
+}
+
+impl Default for NntpServer {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: def_nntp_port(),
+            tls: true,
+            user: String::new(),
+            pass: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// One saved proxy entry in `Settings::proxies`, selectable per download
+/// in Add URL/File and browser capture. Creds plain in state.json like
+/// the global `proxy_url` — ponytail: no OS keychain; add keyring when needed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SavedProxy {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Display label for a saved proxy in ComboBoxes: the name when
+/// non-empty, else the url (unnamed entries still render sensibly).
+pub fn proxy_label(p: &SavedProxy) -> String {
+    if p.name.trim().is_empty() {
+        p.url.clone()
+    } else {
+        p.name.clone()
+    }
+}
+
+/// Split `total` connections across `n` servers: base share for all,
+/// remainder one extra each to the first servers (20 over 3 -> 7/7/6).
+/// `n == 0` or `total == 0` -> empty; when `total < n` the first `total`
+/// servers get 1 and the rest 0 (caller drops zero-count endpoints).
+pub fn divide_connections(total: u32, n: usize) -> Vec<u32> {
+    if n == 0 || total == 0 {
+        return Vec::new();
+    }
+    let n32 = n as u32;
+    let base = total / n32;
+    let rem = total % n32;
+    (0..n)
+        .map(|i| base + u32::from((i as u32) < rem))
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     // No default here broke whole-state parse (data loss) when absent in old state files.
@@ -317,6 +385,12 @@ pub struct Settings {
     pub clipboard_monitor: bool,
     #[serde(default)]
     pub proxy_url: String,
+    /// Saved proxy list selectable per download (Add URL/File, browser
+    /// capture). Migration safety: absent in old state files -> empty list;
+    /// `proxy_url` above stays the global default, credentials stored
+    /// plain like `proxy_url`.
+    #[serde(default)]
+    pub proxies: Vec<SavedProxy>,
     /// Master "Turn on scheduler" (IDM Scheduler dialog). Default on.
     #[serde(default = "def_true")]
     pub scheduler_enabled: bool,
@@ -348,8 +422,16 @@ pub struct Settings {
     #[serde(default)]
     pub nntp_pass: String,
     /// NNTP provider connections per NZB, independent of HTTP max_connections.
+    /// TOTAL pool split across all enabled NNTP servers (see `nntp_servers`).
     #[serde(default = "def_nntp_connections")]
     pub nntp_connections: u32,
+    /// Extra Usenet servers beyond the primary `nntp_*` fields above.
+    /// Keeping the legacy single-server fields as the primary entry (rather
+    /// than migrating to `servers: Vec<_>`) is least invasive: old state
+    /// files deserialize unchanged (absent -> empty), existing call sites
+    /// keep reading `nntp_host` etc., and no config rewrite is needed.
+    #[serde(default)]
+    pub nntp_extra_servers: Vec<NntpServer>,
     /// Auto-unpack archives (rar/zip/7z) after NZB download completes.
     /// Archive deleted only after verified successful extraction.
     #[serde(default = "def_true")]
@@ -469,6 +551,45 @@ pub struct Settings {
     pub chatbot_api_key: String,
     #[serde(default = "def_chatbot_model")]
     pub chatbot_model: String,
+}
+
+impl Settings {
+    /// All usable NNTP servers: primary (`nntp_*` fields, counts as enabled
+    /// when host is non-empty) followed by enabled extras with a host.
+    /// Empty = no Usenet server configured/enabled.
+    pub fn nntp_servers(&self) -> Vec<NntpServer> {
+        let mut out = Vec::new();
+        if !self.nntp_host.trim().is_empty() {
+            out.push(NntpServer {
+                host: self.nntp_host.clone(),
+                port: self.nntp_port,
+                tls: self.nntp_tls,
+                user: self.nntp_user.clone(),
+                pass: self.nntp_pass.clone(),
+                enabled: true,
+            });
+        }
+        out.extend(
+            self.nntp_extra_servers
+                .iter()
+                .filter(|s| s.enabled && !s.host.trim().is_empty())
+                .cloned(),
+        );
+        out
+    }
+
+    /// (server, connection count) endpoints: `total` split across all
+    /// enabled servers via `divide_connections`. Zero-count endpoints
+    /// (more servers than connections) are dropped.
+    pub fn nntp_server_endpoints(&self, total: u32) -> Vec<(NntpServer, u32)> {
+        let servers = self.nntp_servers();
+        divide_connections(total, servers.len())
+            .into_iter()
+            .zip(servers)
+            .filter(|(c, _)| *c > 0)
+            .map(|(c, s)| (s, c))
+            .collect()
+    }
 }
 
 fn def_chatbot_base_url() -> String {
@@ -712,6 +833,7 @@ impl Default for Settings {
             notifications: true,
             clipboard_monitor: false,
             proxy_url: String::new(),
+            proxies: Vec::new(),
             scheduler_enabled: true,
             capture_exts: String::new(),
             capture_min_mb: 0,
@@ -723,6 +845,7 @@ impl Default for Settings {
             nntp_user: String::new(),
             nntp_pass: String::new(),
             nntp_connections: 30,
+            nntp_extra_servers: Vec::new(),
             nzb_auto_unpack: true,
             debrid_preferred: String::new(),
             debrid_rd: DebridProviderCfg::default(),
@@ -1246,6 +1369,36 @@ mod tests {
     }
 
     #[test]
+    fn saved_proxies_absent_defaults_empty_and_round_trips() {
+        // Old state.json without `proxies` -> empty list, global default kept.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("proxies");
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert!(old.proxies.is_empty());
+        // With-proxies JSON round-trips.
+        let s = Settings {
+            proxies: vec![
+                SavedProxy {
+                    name: "Work".into(),
+                    url: "http://user:pass@proxy.example.com:8080".into(),
+                },
+                SavedProxy {
+                    name: String::new(),
+                    url: "socks5://127.0.0.1:1080".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.proxies.len(), 2);
+        // Label: name when set, else url.
+        assert_eq!(proxy_label(&back.proxies[0]), "Work");
+        assert_eq!(proxy_label(&back.proxies[1]), "socks5://127.0.0.1:1080");
+        assert_eq!(proxy_label(&SavedProxy::default()), "");
+    }
+
+    #[test]
     fn effective_proxy_prefers_task_override() {
         assert_eq!(effective_proxy("", "http://g:1"), "http://g:1");
         assert_eq!(effective_proxy("  ", "http://g:1"), "http://g:1");
@@ -1324,6 +1477,70 @@ mod tests {
             s.nntp_connections, 30,
             "old state without field defaults 30"
         );
+    }
+
+    #[test]
+    fn divide_connections_cases() {
+        assert_eq!(divide_connections(20, 3), vec![7, 7, 6]);
+        assert_eq!(divide_connections(30, 1), vec![30]);
+        assert_eq!(divide_connections(10, 2), vec![5, 5]);
+        assert_eq!(divide_connections(5, 5), vec![1, 1, 1, 1, 1]);
+        assert_eq!(divide_connections(2, 4), vec![1, 1, 0, 0], "total < n");
+        assert_eq!(divide_connections(0, 3), Vec::<u32>::new());
+        assert_eq!(divide_connections(20, 0), Vec::<u32>::new());
+        // Sum always preserved when non-empty.
+        for (t, n) in [(1u32, 7usize), (64, 3), (7, 2), (100, 9)] {
+            let v = divide_connections(t, n);
+            assert_eq!(v.iter().sum::<u32>(), t, "total={t} n={n}");
+            assert_eq!(v.len(), n);
+        }
+    }
+
+    #[test]
+    fn nntp_old_single_server_json_migrates_to_list() {
+        // Pre-multi-server state: only legacy nntp_* fields, no extras key.
+        let old = r#"{"nntp_host":"news.example.com","nntp_port":119,"nntp_tls":false,"nntp_user":"u1","nntp_pass":"p1","nntp_connections":20}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(s.nntp_extra_servers.is_empty());
+        let servers = s.nntp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host, "news.example.com");
+        assert_eq!(servers[0].port, 119);
+        assert!(!servers[0].tls);
+        assert_eq!(servers[0].user, "u1");
+        // Total pool goes entirely to the single migrated server.
+        assert_eq!(
+            s.nntp_server_endpoints(20)
+                .iter()
+                .map(|(_, c)| *c)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        // Round-trip: extras persist, legacy fields untouched.
+        let mut s2 = s.clone();
+        s2.nntp_extra_servers.push(NntpServer {
+            host: "news2.example.com".into(),
+            port: 563,
+            tls: true,
+            user: "u2".into(),
+            pass: "p2".into(),
+            enabled: true,
+        });
+        let back: Settings =
+            serde_json::from_value(serde_json::to_value(&s2).unwrap()).unwrap();
+        assert_eq!(back, s2);
+        assert_eq!(back.nntp_servers().len(), 2);
+        // 20 over 2 enabled servers -> 10/10; disabled/blank extras excluded.
+        let mut s3 = s2.clone();
+        s3.nntp_extra_servers.push(NntpServer {
+            enabled: false,
+            ..NntpServer::default()
+        });
+        s3.nntp_extra_servers[0].enabled = false;
+        assert_eq!(s3.nntp_servers().len(), 1, "disabled extra excluded");
+        // Unconfigured: no servers -> clear-error path in nntp.rs.
+        assert!(Settings::default().nntp_servers().is_empty());
+        assert!(Settings::default().nntp_server_endpoints(30).is_empty());
     }
 
     #[test]

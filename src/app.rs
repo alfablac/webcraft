@@ -276,6 +276,23 @@ struct PendingDebridAdd {
 
 type DebridAddSlot =
     std::sync::Arc<std::sync::Mutex<Option<Result<Vec<crate::debrid::ResolvedFile>, String>>>>;
+
+/// Add-dialog MEGA folder awaiting fan-out enumeration. Same fields as
+/// PendingDebridAdd; enumeration needs no debrid provider (names/sizes/
+/// per-file links come from MEGA itself).
+#[derive(Clone)]
+struct PendingMegaAdd {
+    url: String,
+    referrer: String,
+    cookies: String,
+    queue_id: String,
+    start_now: bool,
+    proxy_url: String,
+    debrid_choice: String,
+}
+
+type MegaAddSlot =
+    std::sync::Arc<std::sync::Mutex<Option<Result<Vec<crate::mega::MegaFile>, String>>>>;
 type DebridHostsSlot =
     std::sync::Arc<std::sync::Mutex<Option<(String, Vec<crate::debrid::HostStatus>)>>>;
 
@@ -644,6 +661,9 @@ pub struct DownloadApp {
     add_url: String,
     add_referrer: String,
     add_cookies: String,
+    /// Structured cookies JSON for yt-dlp jar, prefilled from browser
+    /// pending-add (mirrors add_cookies; not user-editable).
+    add_cookies_json: String,
     add_user: String,
     add_pass: String,
     add_key: String,
@@ -672,6 +692,11 @@ pub struct DownloadApp {
     /// normal single magnet task (stream falls back to local torrent).
     debrid_add_slot: DebridAddSlot,
     pending_debrid_add: Option<PendingDebridAdd>,
+    /// MEGA folder fan-out: confirm spawns list_folder, drain creates one
+    /// task per file (per-file link, debrid_file_name set). Failed/empty
+    /// listing -> normal single folder-URL task (fallback).
+    mega_add_slot: MegaAddSlot,
+    pending_mega_add: Option<PendingMegaAdd>,
     /// Add-dialog per-download debrid override ("" = auto; see
     /// DownloadTask::debrid_choice). Reset on confirm/cancel.
     add_debrid_choice: String,
@@ -757,6 +782,10 @@ pub struct DownloadApp {
     sort_asc: bool,
     options_tab: u8,
     options_notice: String,
+    /// Options > General > Activity Log: min level filter ("" = All,
+    /// else applog LV_* value) + auto-scroll toggle. Runtime-only.
+    log_filter: String,
+    log_autoscroll: bool,
     show_add: bool,
     show_progress_for: Option<String>,
     progress_raise: bool,
@@ -1009,6 +1038,7 @@ impl DownloadApp {
             add_url: String::new(),
             add_referrer: String::new(),
             add_cookies: String::new(),
+            add_cookies_json: String::new(),
             add_user: String::new(),
             add_pass: String::new(),
             add_key: String::new(),
@@ -1030,6 +1060,8 @@ impl DownloadApp {
             add_nzb_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             debrid_add_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_debrid_add: None,
+            mega_add_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_mega_add: None,
             add_nzb_url: String::new(),
             add_nzb: None,
             add_nzb_loading: false,
@@ -1097,6 +1129,8 @@ impl DownloadApp {
                 .unwrap_or(true),
             options_tab: 0,
             options_notice: "Changes save automatically.".into(),
+            log_filter: String::new(),
+            log_autoscroll: true,
             show_add: false,
             show_progress_for: None,
             player: None,
@@ -1390,6 +1424,87 @@ impl DownloadApp {
         ctx.request_repaint();
     }
 
+    fn poll_mega_add(&mut self, ctx: &egui::Context) {
+        if self.pending_mega_add.is_none() {
+            return;
+        }
+        let taken = self
+            .mega_add_slot
+            .try_lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let Some(res) = taken else { return };
+        let pending = self.pending_mega_add.take().unwrap();
+        let files = match res {
+            Ok(f) if !f.is_empty() => f,
+            _ => Vec::new(),
+        };
+        let mut ids: Vec<String> = Vec::new();
+        {
+            let mut g = crate::lock_unpoison(&self.rt);
+            if files.is_empty() {
+                let id = g.add_url(
+                    &pending.url,
+                    &pending.queue_id,
+                    &pending.referrer,
+                    &pending.cookies,
+                );
+                if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                    t.debrid_choice = pending.debrid_choice.clone();
+                    g.save();
+                }
+                ids.push(id);
+            } else {
+                for f in &files {
+                    let fname = crate::model::sanitize_filename(&f.name);
+                    let order = g.state.tasks.len() as i64 + 1;
+                    let task = DownloadTask {
+                        id: crate::model::new_id(),
+                        url: f.link.clone(),
+                        dest_dir: crate::model::dest_dir_for(
+                            &g.state.settings.download_dir,
+                            &fname,
+                            g.state.settings.category_subfolders,
+                        ),
+                        filename: fname,
+                        queue_id: if pending.queue_id.is_empty() {
+                            "main".into()
+                        } else {
+                            pending.queue_id.clone()
+                        },
+                        order,
+                        status: TaskStatus::Queued,
+                        category: crate::model::category_for(&f.name).into(),
+                        debrid_choice: pending.debrid_choice.clone(),
+                        debrid_file_name: f.name.clone(),
+                        total: f.size,
+                        referrer: pending.referrer.clone(),
+                        cookies: pending.cookies.clone(),
+                        proxy_url: pending.proxy_url.clone(),
+                        ..Default::default()
+                    };
+                    ids.push(task.id.clone());
+                    dl_history::append_event_default(
+                        &dl_history::DlEvent::new(&task.id, dl_history::KIND_ADDED)
+                            .with_filename(&task.filename)
+                            .with_url(&task.url)
+                            .with_bytes(task.downloaded, task.total.unwrap_or(0)),
+                    );
+                    g.state.tasks.push(task);
+                }
+                g.save();
+            }
+        }
+        if pending.start_now {
+            for id in &ids {
+                if !self.gate_collision(id, true) {
+                    self.start_task(id);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     /// Set pending_collision when task `id` collides; true = start held.
     /// Checks other-task names (ci, same dir) + disk via model::name_taken
     /// (exclude="" so disk hit counts) and own-path sole-owner exemption.
@@ -1556,6 +1671,8 @@ impl DownloadApp {
                 .with_url(&task.url)
                 .with_bytes(task.downloaded, task.total.unwrap_or(0)),
         );
+        crate::lock_unpoison(&self.rt)
+            .log(format!("Started {}: {}", task.filename, task.url));
         // ponytail: duration from created_at is wall-clock incl. pause time;
         // add started_at field when per-session duration matters.
         let started_ms = dl_history::now_ms();
@@ -2282,7 +2399,7 @@ impl DownloadApp {
         {
             let pj = crate::platform::config_dir().join("pending-add.json");
             let pt = crate::platform::config_dir().join("pending-add.txt");
-            let mut pending_add: Option<(String, String, String)> = None;
+            let mut pending_add: Option<(String, String, String, String)> = None;
             if let Ok(s) = std::fs::read_to_string(&pj) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                     pending_add = v.get("url").and_then(|x| x.as_str()).map(|u| {
@@ -2293,6 +2410,10 @@ impl DownloadApp {
                                 .unwrap_or("")
                                 .to_string(),
                             v.get("cookies")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            v.get("cookiesJson")
                                 .and_then(|c| c.as_str())
                                 .unwrap_or("")
                                 .to_string(),
@@ -2308,16 +2429,17 @@ impl DownloadApp {
                     let u = s.trim().to_string();
                     if !u.is_empty() {
                         let _ = std::fs::remove_file(&pt);
-                        pending_add = Some((u, String::new(), String::new()));
+                        pending_add = Some((u, String::new(), String::new(), String::new()));
                     }
                 }
             }
-            if let Some((u, referrer, cookies)) = pending_add {
+            if let Some((u, referrer, cookies, cookies_json)) = pending_add {
                 self.show_window_full(ctx);
                 self.tab = Tab::Downloads;
                 self.add_url = u;
                 self.add_referrer = referrer;
                 self.add_cookies = cookies;
+                self.add_cookies_json = cookies_json;
                 self.show_add = true;
                 self.add_just_opened = true;
                 self.add_raise_frames = 90;
@@ -3677,6 +3799,7 @@ impl eframe::App for DownloadApp {
             crate::platform::trace("app::update first frame");
         }
         self.poll_debrid_add(ctx);
+        self.poll_mega_add(ctx);
         // Paint full viewport first: panel gaps otherwise show OS black (#09) as a vertical bar.
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             ctx.screen_rect(),
@@ -5480,6 +5603,28 @@ fn button_preset_preview(ui: &mut egui::Ui, p: &crate::model::ButtonPreset) {
     }
 }
 
+/// Min-level rank for the Activity Log filter (unknown levels = INFO).
+fn log_level_rank(level: &str) -> u8 {
+    match level {
+        downloadcraft_lib::applog::LV_DEBUG => 0,
+        downloadcraft_lib::applog::LV_INFO => 1,
+        downloadcraft_lib::applog::LV_WARN => 2,
+        downloadcraft_lib::applog::LV_ERROR => 3,
+        _ => 1,
+    }
+}
+
+/// UTC `HH:MM:SS` for an epoch-ms timestamp (pure civil math, no crate).
+fn fmt_log_time(ts_ms: u64) -> String {
+    let secs = ts_ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
 /// Section header: label + 6px + separator (Options / editor groups).
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).color(theme::TEXT).strong());
@@ -7012,12 +7157,39 @@ impl DownloadApp {
                     });
                 ui.end_row();
                 ui::form_label(ui, "Proxy");
-                ui.add(
-                    ui::text_field(&mut t.proxy_url)
-                        .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
-                        .desired_width(ui.available_width()),
-                )
-                .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
+                ui.vertical(|ui| {
+                    let saved = crate::lock_unpoison(&app.rt).state.settings.proxies.clone();
+                    {
+                        let cur_label = if t.proxy_url.trim().is_empty() {
+                            "Global default".to_string()
+                        } else {
+                            saved
+                                .iter()
+                                .find(|p| p.url == t.proxy_url)
+                                .map(crate::model::proxy_label)
+                                .unwrap_or_else(|| t.proxy_url.clone())
+                        };
+                        egui::ComboBox::from_id_salt("cap-proxy")
+                            .selected_text(cur_label)
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(t.proxy_url.trim().is_empty(), "Global default").clicked() {
+                                    t.proxy_url.clear();
+                                }
+                                for p in &saved {
+                                    if ui.selectable_label(t.proxy_url == p.url, crate::model::proxy_label(p)).clicked() {
+                                        t.proxy_url = p.url.clone();
+                                    }
+                                }
+                            });
+                    }
+                    ui.add(
+                        ui::text_field(&mut t.proxy_url)
+                            .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
+                            .desired_width(ui.available_width()),
+                    )
+                    .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
+                });
                 ui.end_row();
             });
             // Engine choice for streams/video pages: native (default) vs yt-dlp.
@@ -7874,11 +8046,11 @@ impl DownloadApp {
                     });
                     if yt_probe_eligible(app.add_url.trim()) {
                         ui.add_space(theme::SP_SM);
-                        let (u, r, c) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone());
+                        let (u, r, c, cj) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone(), app.add_cookies_json.clone());
                         let rt = app.tokio_rt.clone();
                         let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
                         let eff_proxy = crate::model::effective_proxy(&app.add_proxy, &global_proxy).to_string();
-                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, "", &rt, &eff_proxy);
+                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, &cj, &rt, &eff_proxy);
                     } else if !app.add_url.trim().is_empty() {
                         // HTTP prewarm: stable probe-able URL spawns background
                         // probe+plan; confirm never waits for it.
@@ -7920,12 +8092,41 @@ impl DownloadApp {
                         );
                         ui.end_row();
                         ui::form_label(ui, "Proxy");
-                        ui.add(
-                            ui::text_field(&mut app.add_proxy)
-                                .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
-                                .desired_width(ui.available_width()),
-                        )
-                        .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
+                        ui.vertical(|ui| {
+                            {
+                                let saved = crate::lock_unpoison(&app.rt).state.settings.proxies.clone();
+                                {
+                                    let cur_label = if app.add_proxy.trim().is_empty() {
+                                        "Global default".to_string()
+                                    } else {
+                                        saved
+                                            .iter()
+                                            .find(|p| p.url == app.add_proxy)
+                                            .map(crate::model::proxy_label)
+                                            .unwrap_or_else(|| app.add_proxy.clone())
+                                    };
+                                    egui::ComboBox::from_id_salt("add-proxy")
+                                        .selected_text(cur_label)
+                                        .width(ui.available_width())
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_label(app.add_proxy.trim().is_empty(), "Global default").clicked() {
+                                                app.add_proxy.clear();
+                                            }
+                                            for p in &saved {
+                                                if ui.selectable_label(app.add_proxy == p.url, crate::model::proxy_label(p)).clicked() {
+                                                    app.add_proxy = p.url.clone();
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                            ui.add(
+                                ui::text_field(&mut app.add_proxy)
+                                    .hint_text("empty = global proxy; http://user:pass@host:port or socks5://host:port")
+                                    .desired_width(ui.available_width()),
+                            )
+                            .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
+                        });
                         ui.end_row();
                         ui::form_label(ui, "Description");
                         ui.add(fill_edit(&mut app.add_desc));
@@ -8081,6 +8282,53 @@ impl DownloadApp {
                         !(n.is_empty() && v.is_empty()) && header_row_error(n, v).is_none()
                     })
                     .collect();
+                // MEGA folder fan-out: enumerate async, poll_mega_add
+                // creates one task per file (per-file link). No debrid
+                // provider needed for enumeration; each task re-resolves
+                // via debrid at download start like other hoster links.
+                // Runs regardless of debrid_choice (even "none").
+                if crate::mega::is_mega_folder_url(&url) && self.pending_mega_add.is_none() {
+                    let (_settings, proxy) = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        (
+                            g.state.settings.clone(),
+                            crate::model::effective_proxy(
+                                &proxy_override,
+                                &g.state.settings.proxy_url,
+                            )
+                            .to_string(),
+                        )
+                    };
+                    if let Ok(mut s) = self.mega_add_slot.try_lock() {
+                        *s = None;
+                    }
+                    self.pending_mega_add = Some(PendingMegaAdd {
+                        url: url.clone(),
+                        referrer: referrer.clone(),
+                        cookies: cookies.clone(),
+                        queue_id: queue.clone(),
+                        start_now,
+                        proxy_url: proxy_override.clone(),
+                        debrid_choice: dchoice.clone(),
+                    });
+                    let slot = self.mega_add_slot.clone();
+                    let rt2 = self.tokio_rt.clone();
+                    let ctx2 = ctx.clone();
+                    let url_clone = url.clone();
+                    std::thread::spawn(move || {
+                        let client = engine::build_client(&proxy);
+                        let res = rt2
+                            .block_on(crate::mega::list_folder(client, &url_clone))
+                            .map(|f| f.files);
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(res);
+                        }
+                        ctx2.request_repaint();
+                    });
+                    self.show_add = false;
+                    self.add_raise_frames = 0;
+                    return;
+                }
                 // Debrid magnet fan-out: resolve async, poll_debrid_add
                 // creates one task per file. Picker selection ignored here
                 // (provider file names != librqbit indices).
@@ -8140,6 +8388,9 @@ impl DownloadApp {
                         g.state.settings.max_connections
                     };
                     if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                        // add_url has no cookies_json param: browser
+                        // pending-add prefill rides here (yt-dlp jar).
+                        t.cookies_json = self.add_cookies_json.clone();
                         t.segments = segs;
                         if self.prewarm_add.url == url.trim() {
                             t.accept_ranges = self.prewarm_add.accept_ranges;
@@ -8227,6 +8478,7 @@ impl DownloadApp {
                     }
                     id
                 };
+                crate::lock_unpoison(&self.rt).log(format!("Task added: {url}"));
                 if self.gate_collision(&id, start_now) {
                     // Held: dialog Rename/Overwrite/Cancel decides.
                 } else if start_now {
@@ -8246,6 +8498,7 @@ impl DownloadApp {
                 self.add_nzb_loading = false;
                 self.add_referrer.clear();
                 self.add_cookies.clear();
+                self.add_cookies_json.clear();
                 self.add_user.clear();
                 self.add_pass.clear();
                 self.add_key.clear();
@@ -12028,6 +12281,84 @@ impl DownloadApp {
         });
     }
 
+    /// Options > General > Activity Log: session ring from
+    /// `applog::snapshot()` (redacted at write, newest last). Clone is
+    /// bounded (<= applog::MAX_MEM_ENTRIES); filter is a min-level rank.
+    fn ui_activity_log(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Activity Log");
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Level")
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
+            for (val, label) in [
+                ("", "All"),
+                (downloadcraft_lib::applog::LV_DEBUG, "Debug+"),
+                (downloadcraft_lib::applog::LV_INFO, "Info+"),
+                (downloadcraft_lib::applog::LV_WARN, "Warn+"),
+                (downloadcraft_lib::applog::LV_ERROR, "Error"),
+            ] {
+                ui.selectable_value(&mut self.log_filter, val.to_string(), label);
+            }
+            ui.checkbox(&mut self.log_autoscroll, "Auto-scroll");
+            if ui::Btn::secondary("Clear").icon(Icon::Delete).show(ui).clicked() {
+                downloadcraft_lib::applog::clear();
+            }
+        });
+        let min_rank = log_level_rank(&self.log_filter);
+        let entries: Vec<downloadcraft_lib::applog::LogRecord> =
+            downloadcraft_lib::applog::snapshot()
+                .into_iter()
+                .filter(|r| log_level_rank(&r.level) >= min_rank)
+                .collect();
+        ui.label(
+            egui::RichText::new(format!(
+                "{} entries (session, newest last; full log in logs folder)",
+                entries.len()
+            ))
+            .color(theme::TEXT_FAINT)
+            .small(),
+        );
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("options-activity-log")
+            .max_height(220.0)
+            .auto_shrink([false, false]);
+        if self.log_autoscroll {
+            scroll = scroll.stick_to_bottom(true);
+        }
+        scroll.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if entries.is_empty() {
+                ui.label(
+                    egui::RichText::new("No log entries yet.")
+                        .color(theme::TEXT_FAINT)
+                        .small(),
+                );
+            }
+            for r in &entries {
+                let color = match r.level.as_str() {
+                    downloadcraft_lib::applog::LV_ERROR => theme::ERR,
+                    downloadcraft_lib::applog::LV_WARN => theme::WARN,
+                    downloadcraft_lib::applog::LV_DEBUG => theme::TEXT_FAINT,
+                    _ => theme::TEXT_MUTED,
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} [{}] {}",
+                        fmt_log_time(r.ts_ms),
+                        r.level,
+                        r.cat,
+                        r.msg
+                    ))
+                    .color(color)
+                    .small()
+                    .monospace(),
+                );
+            }
+        });
+    }
+
     fn ui_options(&mut self, ui: &mut egui::Ui) {
         ui.heading("Options");
         ui.label(
@@ -12113,6 +12444,8 @@ impl DownloadApp {
                         ui.end_row();
                     });
                     ui.label(egui::RichText::new(format!("Config directory: {}", platform::config_dir().display())).color(theme::TEXT_FAINT).small());
+                    ui.add_space(theme::SP_MD);
+                    self.ui_activity_log(ui);
                     ui.add_space(theme::SP_MD);
                     section(ui, "Backup (settings only)");
                     ui.horizontal_wrapped(|ui| {
@@ -12233,6 +12566,36 @@ impl DownloadApp {
                     });
                     ui.label(egui::RichText::new("Leave empty for a direct connection. Default for all downloads; override per download in Add URL/File (Transfer → Proxy), browser Capture, or Progress dialog. SOCKS needs no extra setup.").color(theme::TEXT_FAINT).small());
                     ui.add_space(theme::SP_MD);
+                    section(ui, "Saved proxies");
+                    let mut remove_proxy: Option<usize> = None;
+                    for (i, p) in settings.proxies.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                ui::text_field(&mut p.name)
+                                    .hint_text("Name")
+                                    .desired_width(160.0),
+                            );
+                            ui.add(
+                                ui::text_field(&mut p.url)
+                                    .hint_text("http://user:pass@host:port or socks5://host:port")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if ui::secondary_button(ui, "Remove").clicked() {
+                                remove_proxy = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove_proxy {
+                        settings.proxies.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui::LABEL_W + 12.0);
+                        if ui::secondary_button(ui, "Add proxy").clicked() {
+                            settings.proxies.push(crate::model::SavedProxy::default());
+                        }
+                    });
+                    ui.label(egui::RichText::new("Saved proxies are selectable per download in Add URL/File and browser capture; the global proxy above remains the default.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(theme::SP_MD);
                     section(ui, "NNTP (Usenet / NZB)");
                     ui::form_grid("opts-nntp-grid").show(ui, |ui| {
                         ui::form_label(ui, "Server");
@@ -12259,8 +12622,57 @@ impl DownloadApp {
                         );
                         ui.end_row();
                     });
-                    ui.add(egui::Slider::new(&mut settings.nntp_connections, 1..=64).text("Connections"));
-                    ui.label(egui::RichText::new("Provider connection limit applies per NZB download.").color(theme::TEXT_FAINT).small());
+                    // Extra Usenet servers: total Connections pool below is
+                    // split across primary + all enabled extras.
+                    let mut remove_extra: Option<usize> = None;
+                    for (i, srv) in settings.nntp_extra_servers.iter_mut().enumerate() {
+                        ui.add_space(theme::SP_SM);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("Extra server {}", i + 1)).strong());
+                            ui.checkbox(&mut srv.enabled, "Enabled");
+                            if ui::secondary_button(ui, "Remove").clicked() {
+                                remove_extra = Some(i);
+                            }
+                        });
+                        ui::form_grid(&format!("opts-nntp-extra-{i}")).show(ui, |ui| {
+                            ui::form_label(ui, "Server");
+                            ui.add(
+                                ui::text_field(&mut srv.host)
+                                    .hint_text("news2.example.com")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+                            ui::form_label(ui, "Port");
+                            ui.horizontal(|ui| {
+                                ui.add_sized([DRAG_W, theme::BTN_H], drag(&mut srv.port).range(1..=65535));
+                                ui.checkbox(&mut srv.tls, "TLS");
+                            });
+                            ui.end_row();
+                            ui::form_label(ui, "Username");
+                            ui.add(fill_edit(&mut srv.user));
+                            ui.end_row();
+                            ui::form_label(ui, "Password");
+                            ui.add(
+                                ui::text_field(&mut srv.pass)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+                        });
+                    }
+                    if let Some(i) = remove_extra {
+                        settings.nntp_extra_servers.remove(i);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui::LABEL_W + 12.0);
+                        if ui::secondary_button(ui, "Add Server").clicked() {
+                            settings
+                                .nntp_extra_servers
+                                .push(crate::model::NntpServer::default());
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut settings.nntp_connections, 1..=64).text("Connections (total, split across servers)"));
+                    ui.label(egui::RichText::new("Provider connection limit applies per NZB download. Total is divided across all enabled servers.").color(theme::TEXT_FAINT).small());
                     ui.checkbox(&mut settings.nzb_auto_unpack, "Auto-unpack archives after NZB download (RAR/ZIP/7z, incl. multi-volume; archive deleted only on successful extraction)");
                     ui.label(egui::RichText::new("Add an .nzb URL (or NZB file path) as a download to fetch via NNTP. NNTP connections separate from HTTP Connections per file. Higher = faster, respect provider limit. PAR2 repair included when NZB ships .par2 files. Archive password taken from inside NZB: <meta type=\"password\">, or {{password}} in NZB/archive name.").color(theme::TEXT_FAINT).small());
                 }

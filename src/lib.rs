@@ -13,6 +13,7 @@ pub mod engine;
 pub mod ftp;
 pub mod grabber;
 pub mod hls;
+pub mod mega;
 pub mod metalink;
 pub mod model;
 pub mod mpd;

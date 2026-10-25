@@ -258,6 +258,19 @@ impl RdCheck {
     }
 }
 
+/// One link from `POST /unrestrict/folder`. Upstream shape is not
+/// verifiable without an API key, so [`parse_unrestrict_folder`] accepts
+/// several documented/observed forms and normalizes to this.
+// No Debug: holds resolved download URLs, which must never be logged.
+#[derive(Clone, Default, PartialEq)]
+pub struct RdFolderLink {
+    /// Resolved download URL, or the original hoster link when the folder
+    /// entry was not yet unrestricted. Sensitive: never log.
+    pub link: String,
+    /// File name when upstream provides one; empty otherwise.
+    pub filename: String,
+}
+
 /// Alternative generated link (`alternative[]` in unrestrict response).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RdAlternative {
@@ -513,6 +526,73 @@ pub fn parse_unrestrict_link(json: &str) -> Result<RdDownload, String> {
     }
 }
 
+/// Normalize one `/unrestrict/folder` element: plain string link, or an
+/// object with any of `download`/`link`/`url` and `filename`/`name`.
+/// Returns `None` when no usable (non-empty) URL is present.
+fn folder_link_from_value(v: &serde_json::Value) -> Option<RdFolderLink> {
+    if let Some(s) = v.as_str() {
+        let link = s.trim().to_string();
+        return (!link.is_empty()).then_some(RdFolderLink {
+            link,
+            filename: String::new(),
+        });
+    }
+    let obj = v.as_object()?;
+    let link = ["download", "link", "url"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let filename = ["filename", "name"]
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(RdFolderLink { link, filename })
+}
+
+/// Parse `POST /unrestrict/folder` body. The exact upstream shape is not
+/// verifiable without an API key, so this is defensive: accepts a JSON
+/// array of entries or a single object/entry; wrappers such as
+/// `{"files": …}`, `{"links": …}`, `{"data": …}`, or an object keyed by
+/// id/handle are unwrapped one level. Each entry may be a plain string
+/// (a link), an object with any of `download`/`link`/`url` for the URL
+/// and `filename`/`name` for the name, or an unrestrict/link-style object
+/// (has `download` + `filename` + `host`). Entries with no usable URL are
+/// skipped; errors only when nothing usable parses.
+pub fn parse_unrestrict_folder(json: &str) -> Result<Vec<RdFolderLink>, String> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("Real-Debrid /unrestrict/folder parse failed: {e}"))?;
+    let items: Vec<&serde_json::Value> = match &v {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        serde_json::Value::Object(o) => {
+            let wrapped = ["files", "links", "data"]
+                .iter()
+                .find_map(|k| o.get(*k))
+                .filter(|x| x.is_array() || x.is_object() || x.is_string());
+            match wrapped {
+                Some(serde_json::Value::Array(a)) => a.iter().collect(),
+                Some(other) => vec![other],
+                None => {
+                    // Either one link object, or a map keyed by id/handle.
+                    if folder_link_from_value(&v).is_some() {
+                        vec![&v]
+                    } else {
+                        o.values().collect()
+                    }
+                }
+            }
+        }
+        other => vec![other],
+    };
+    let out: Vec<RdFolderLink> = items.iter().filter_map(|i| folder_link_from_value(i)).collect();
+    if out.is_empty() {
+        return Err("Real-Debrid /unrestrict/folder returned no usable links".to_string());
+    }
+    Ok(out)
+}
+
 pub fn parse_torrent_info(json: &str) -> Result<RdTorrentInfo, String> {
     serde_json::from_str(json).map_err(|e| format!("Real-Debrid /torrents/info parse failed: {e}"))
 }
@@ -662,6 +742,17 @@ impl RdClient {
     /// [`Self::unrestrict_link`]. Sensitive: never log the result.
     pub async fn unrestrict_download_url(&self, url: &str) -> Result<String, String> {
         Ok(self.unrestrict_link(url).await?.download)
+    }
+
+    /// `POST /unrestrict/folder` — list/unrestrict a hoster folder link
+    /// (e.g. a MEGA folder share). Folder links that need a decryption
+    /// fragment carry it only on the wire in the `link` field; never log
+    /// `url` or the returned links.
+    pub async fn unrestrict_folder(&self, url: &str) -> Result<Vec<RdFolderLink>, String> {
+        let text = self
+            .post_form_text("/unrestrict/folder", &[("link", url)])
+            .await?;
+        parse_unrestrict_folder(&text)
     }
 
     /// `GET /torrents/instantAvailability/{hash}` — is this torrent hash
@@ -906,6 +997,82 @@ mod tests {
         .unwrap();
         assert_eq!(multi.id, "A");
         assert!(parse_unrestrict_link("[]").is_err());
+    }
+
+    #[test]
+    fn parse_folder_array_of_link_objects() {
+        let links = parse_unrestrict_folder(
+            r#"[{"download":"https://download.real-debrid.com/d/A/a.rar","filename":"a.rar","host":"mega.nz"},{"link":"https://download.real-debrid.com/d/B/b.rar","name":"b.rar"},{"url":"https://example.com/c.rar","filename":"c.rar"}]"#,
+        )
+        .unwrap();
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].link, "https://download.real-debrid.com/d/A/a.rar");
+        assert_eq!(links[0].filename, "a.rar");
+        assert_eq!(links[1].link, "https://download.real-debrid.com/d/B/b.rar");
+        assert_eq!(links[1].filename, "b.rar");
+        assert_eq!(links[2].link, "https://example.com/c.rar");
+        assert_eq!(links[2].filename, "c.rar");
+    }
+
+    #[test]
+    fn parse_folder_plain_strings_and_single_forms() {
+        // Plain-string array entries.
+        let links = parse_unrestrict_folder(
+            r#"["https://download.real-debrid.com/d/A/a.rar","https://mega.nz/file/H#KEY"]"#,
+        )
+        .unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].link, "https://download.real-debrid.com/d/A/a.rar");
+        assert!(links[0].filename.is_empty());
+        assert_eq!(links[1].link, "https://mega.nz/file/H#KEY");
+        // Single object (not an array).
+        let one = parse_unrestrict_folder(
+            r#"{"download":"https://download.real-debrid.com/d/A/a.rar","filename":"a.rar"}"#,
+        )
+        .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].filename, "a.rar");
+    }
+
+    #[test]
+    fn parse_folder_unrestrict_style_and_wrappers() {
+        // unrestrict/link-style object in an array.
+        let links = parse_unrestrict_folder(
+            r#"[{"id":"ABC123","filename":"file.part1.rar","mimeType":"application/x-rar-compressed","filesize":3146063544,"link":"https://mega.nz/folder/X/file/H","host":"mega.nz","chunks":16,"crc":1,"download":"https://download.real-debrid.com/d/XYZ/file.part1.rar","streamable":0}]"#,
+        )
+        .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].link,
+            "https://download.real-debrid.com/d/XYZ/file.part1.rar"
+        );
+        assert_eq!(links[0].filename, "file.part1.rar");
+        // Wrapped arrays.
+        let wrapped = parse_unrestrict_folder(
+            r#"{"files":[{"download":"https://download.real-debrid.com/d/A/a.rar","filename":"a.rar"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(wrapped.len(), 1);
+        // Object keyed by id/handle.
+        let keyed = parse_unrestrict_folder(
+            r#"{"H1":{"download":"https://download.real-debrid.com/d/A/a.rar","filename":"a.rar"},"H2":"https://download.real-debrid.com/d/B/b.rar"}"#,
+        )
+        .unwrap();
+        assert_eq!(keyed.len(), 2);
+    }
+
+    #[test]
+    fn parse_folder_skips_unusable_and_errors_when_empty() {
+        let links = parse_unrestrict_folder(
+            r#"[{"filename":"no-url.rar"},{"download":"  "},42,null,"https://download.real-debrid.com/d/A/a.rar"]"#,
+        )
+        .unwrap();
+        assert_eq!(links.len(), 1);
+        assert!(parse_unrestrict_folder("[]").is_err());
+        assert!(parse_unrestrict_folder("{}").is_err());
+        assert!(parse_unrestrict_folder(r#"[{"filename":"only-a-name"}]"#).is_err());
+        assert!(parse_unrestrict_folder("not json").is_err());
+        assert!(parse_unrestrict_folder("").is_err());
     }
 
     #[test]

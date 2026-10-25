@@ -79,8 +79,32 @@ function sweepRecords(now = Date.now()) {
   for (const [k, r] of requestRecords) if (r.time && now - r.time > RECORD_TTL_MS) requestRecords.delete(k);
   while (requestRecords.size > RECORD_MAX) requestRecords.delete(requestRecords.keys().next().value); // ponytail: FIFO cap
 }
+// Safe browser request headers per URL (allowlist only; raw Cookie never
+// forwarded — cookies.getAll covers it and the engine Cookie field must
+// stay canonical). Captured on onBeforeSendHeaders ("requestHeaders"
+// extraInfoSpec only, no "extraHeaders"); some protected headers may be
+// absent in MV3, so sendDownload falls back to navigator.userAgent.
+// Same TTL discipline as requestRecords.
+const HEADER_ALLOW = ["user-agent", "accept-language", "authorization"];
+const urlHeaders = new Map(); // url -> {headers, time}
+function captureReqHeaders(details) {
+  try {
+    if (!details || !details.url || !Array.isArray(details.requestHeaders)) return;
+    const out = {};
+    for (const h of details.requestHeaders) {
+      const n = String(h.name || "").toLowerCase();
+      if (HEADER_ALLOW.includes(n) && h.value) out[n] = String(h.value).slice(0, 2048);
+    }
+    if (!Object.keys(out).length) return;
+    const now = Date.now();
+    for (const [u, e] of urlHeaders) if (now - e.time > RECORD_TTL_MS) urlHeaders.delete(u);
+    while (urlHeaders.size >= RECORD_MAX) urlHeaders.delete(urlHeaders.keys().next().value); // ponytail: FIFO cap
+    urlHeaders.set(details.url, { headers: out, time: now });
+  } catch (e) {}
+}
 function recordRequest(details) {
   try {
+    captureReqHeaders(details); // before media filter: downloads are not media-ish
     if (!details || !details.requestId || !(details.tabId >= 0)) return;
     if (!isMediaIsh(details)) return;
     sweepRecords();
@@ -186,7 +210,7 @@ if (chrome.webRequest) {
     const F = { urls: ["<all_urls>"] };
     const kill = (d) => { try { requestRecords.delete(d.requestId); } catch (e) {} };
     if (chrome.webRequest.onBeforeRequest) chrome.webRequest.onBeforeRequest.addListener(recordRequest, F);
-    if (chrome.webRequest.onBeforeSendHeaders) chrome.webRequest.onBeforeSendHeaders.addListener(recordRequest, F);
+    if (chrome.webRequest.onBeforeSendHeaders) chrome.webRequest.onBeforeSendHeaders.addListener(recordRequest, F, ["requestHeaders"]);
     if (chrome.webRequest.onCompleted) chrome.webRequest.onCompleted.addListener(kill, F);
     if (chrome.webRequest.onErrorOccurred) chrome.webRequest.onErrorOccurred.addListener(kill, F);
   } catch (e) {}
@@ -287,6 +311,14 @@ async function sendDownload(url, tab, extra = {}) {
   // Referrer = video page (permalink), not feed tab URL (x.com/home).
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
   const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
+  // Last-seen allowlisted headers for this exact URL; UA fallback so the
+  // engine never has to fall back to the webcraft UA.
+  try {
+    const got = urlHeaders.get(url);
+    const headers = { ...(got && got.headers ? got.headers : {}) };
+    if (!headers["user-agent"] && typeof navigator !== "undefined" && navigator.userAgent) headers["user-agent"] = navigator.userAgent;
+    if (Object.keys(headers).length) msg.headers = headers;
+  } catch (e) {}
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;
   if (extra.pageTitle) msg.pageTitle = extra.pageTitle;
   if (extra.intent) msg.intent = extra.intent;
@@ -534,3 +566,5 @@ if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tab
   if (n) persistCandidates();
 });
 if (chrome.tabs && chrome.tabs.onRemoved) chrome.tabs.onRemoved.addListener((tabId) => { for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); persistCandidates(); });
+// ponytail: urlHeaders intentionally not persisted/tab-cleaned — 10-min TTL
+// bounds it; SW restart only loses headers, UA fallback covers the gap.
