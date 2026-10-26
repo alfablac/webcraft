@@ -120,26 +120,44 @@ function sweepRecords(now = Date.now()) {
   for (const [k, r] of requestRecords) if (r.time && now - r.time > RECORD_TTL_MS) requestRecords.delete(k);
   while (requestRecords.size > RECORD_MAX) requestRecords.delete(requestRecords.keys().next().value); // ponytail: FIFO cap
 }
-// Safe browser request headers per URL (allowlist only; raw Cookie never
-// forwarded — cookies.getAll covers it and the engine Cookie field must
-// stay canonical). Captured on onBeforeSendHeaders ("requestHeaders"
-// extraInfoSpec); sendDownload falls back to navigator.userAgent. Same
-// TTL discipline as requestRecords. Kept in sync with Chromium.
-const HEADER_ALLOW = ["user-agent", "accept-language", "authorization"];
+// Browser request headers per URL: DENYLIST capture (most downloads are
+// gated on header values — UA, Referer, Origin, Authorization, custom
+// X- tokens...). Stack-owned / hop-by-hop / conditional / content names
+// are never forwarded: the engine's send-time denylist is authoritative,
+// and host flattening re-filters. Raw Cookie never forwarded —
+// cookies.getAll covers it and the engine Cookie field stays canonical.
+// Captured on onBeforeSendHeaders ("requestHeaders" only — Firefox has
+// no "extraHeaders" extraInfoSpec; never add it here). Values over 4096
+// are DROPPED (never sliced — a truncated token is worse than none);
+// duplicates join with ", ". Same TTL discipline as requestRecords.
+// Kept in sync with Chromium (except the listener spec).
+const HEADER_DENY = new Set(["cookie", "cookie2", "host", "content-length", "connection", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-connection", "accept-encoding", "range", "if-range", "if-modified-since", "if-none-match", "if-unmodified-since", "if-match", "cache-control", "pragma", "content-type", "priority", "set-cookie", "www-authenticate"]);
+const HEADER_MAX_PER_URL = 24;
 const urlHeaders = new Map(); // url -> {headers, time}
+function headerKeyIndex(url) {
+  // Dual key: exact URL plus origin+path, so a redirect-final or
+  // query-drifted send still finds the browser's headers.
+  try { const u = new URL(url); return u.origin + u.pathname; } catch (e) { return url; }
+}
 function captureReqHeaders(details) {
   try {
     if (!details || !details.url || !Array.isArray(details.requestHeaders)) return;
     const out = {};
     for (const h of details.requestHeaders) {
       const n = String(h.name || "").toLowerCase();
-      if (HEADER_ALLOW.includes(n) && h.value) out[n] = String(h.value).slice(0, 2048);
+      if (!n || n.length > 64 || /[\r\n=:]/.test(n) || HEADER_DENY.has(n)) continue;
+      const v = String(h.value || "");
+      if (!v || v.length > 4096 || /[\r\n]/.test(v)) continue;
+      out[n] = out[n] ? out[n] + ", " + v : v;
+      if (Object.keys(out).length > HEADER_MAX_PER_URL) delete out[n];
     }
     if (!Object.keys(out).length) return;
     const now = Date.now();
     for (const [u, e] of urlHeaders) if (now - e.time > RECORD_TTL_MS) urlHeaders.delete(u);
     while (urlHeaders.size >= RECORD_MAX) urlHeaders.delete(urlHeaders.keys().next().value); // ponytail: FIFO cap
     urlHeaders.set(details.url, { headers: out, time: now });
+    const idx = headerKeyIndex(details.url);
+    if (idx !== details.url) urlHeaders.set(idx, { headers: out, time: now });
   } catch (e) {}
 }
 function recordRequest(details) {
@@ -267,15 +285,19 @@ async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
   let cookiesJson = "";
   // Cookies for page host, not sniffed CDN host (see Chromium).
-  try { const cs = await browser.cookies.getAll({ url: extra.pageUrl || extra.cookieUrl || url }); cookies = cs.map(c => `${c.name}=${c.value}`).join("; "); cookiesJson = JSON.stringify(cs.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expirationDate: c.expirationDate, secure: c.secure, httpOnly: c.httpOnly, hostOnly: c.hostOnly }))); } catch (e) {}
+  // storeId from the tab so container/private sessions resolve their own
+  // cookie store, not the default one.
+  try { const cq = { url: extra.pageUrl || extra.cookieUrl || url }; if (tab && tab.cookieStoreId) cq.storeId = tab.cookieStoreId; const cs = await browser.cookies.getAll(cq); cookies = cs.map(c => `${c.name}=${c.value}`).join("; "); cookiesJson = JSON.stringify(cs.map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expirationDate: c.expirationDate, secure: c.secure, httpOnly: c.httpOnly, hostOnly: c.hostOnly }))); } catch (e) {}
   const referrer = extra.referrer != null ? extra.referrer : (extra.pageUrl || extra.cookieUrl || (tab ? tab.url : ""));
   const msg = { type: "download", url, referrer, referer: referrer, cookies, cookiesJson, filename: extra.filename ? basename(extra.filename) : filenameFromUrl(url) };
-  // Last-seen allowlisted headers for this exact URL; UA fallback so the
-  // engine never has to fall back to the webcraft UA.
+  // Last-seen browser headers for this URL (exact or origin+path index);
+  // UA + Accept-Language synthesis so the engine never has to fall back
+  // to the webcraft UA on never-requested URLs.
   try {
-    const got = urlHeaders.get(url);
+    const got = urlHeaders.get(url) || urlHeaders.get(headerKeyIndex(url));
     const headers = { ...(got && got.headers ? got.headers : {}) };
     if (!headers["user-agent"] && typeof navigator !== "undefined" && navigator.userAgent) headers["user-agent"] = navigator.userAgent;
+    if (!headers["accept-language"] && typeof navigator !== "undefined" && Array.isArray(navigator.languages) && navigator.languages.length) headers["accept-language"] = navigator.languages.join(",");
     if (Object.keys(headers).length) msg.headers = headers;
   } catch (e) {}
   if (extra.pageUrl) msg.pageUrl = extra.pageUrl;

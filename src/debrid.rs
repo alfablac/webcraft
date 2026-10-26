@@ -453,6 +453,20 @@ pub fn url_host(url: &str) -> String {
     host.strip_prefix("www.").unwrap_or(host).to_string()
 }
 
+/// Google Drive direct-download hosts (share pages + one-shot takeout/
+/// usercontent GETs). These serve direct bytes, not hoster landing pages;
+/// debrid providers cannot unrestrict them, and the fuzzy host matcher
+/// would otherwise claim them (takeout host scores 1.0 vs drive.google.com).
+/// Direct-only: never route through debrid.
+pub fn is_google_drive_url(url: &str) -> bool {
+    let h = url_host(url);
+    h == "drive.google.com"
+        || h == "usercontent.google.com"
+        || h.ends_with(".usercontent.google.com")
+        || h == "googleusercontent.com"
+        || h.ends_with(".googleusercontent.com")
+}
+
 pub fn is_magnet(url: &str) -> bool {
     crate::torrent::is_magnet(url)
 }
@@ -1171,6 +1185,22 @@ pub async fn resolve_hoster_result(
     url: &str,
     choice: &str,
 ) -> ResolveHosterResult {
+    // transfer.it is debrid-unsupported (no provider lists the host):
+    // handled natively in `crate::transferit`. Hard-reject so no caller
+    // can translate a transfer URL into a provider call by accident.
+    if crate::transferit::is_task_url(url) {
+        return (Err("transfer.it is not supported by debrid providers".into()), true);
+    }
+    // Google Drive: direct-only. Hard-reject as backstop so no caller can
+    // unrestrict a Drive URL by accident; the dispatcher skips debrid for
+    // Drive links entirely (stream.rs gate), so this only fires on direct
+    // calls that have no direct-download fallback of their own.
+    if is_google_drive_url(url) {
+        return (
+            Err("Google Drive links are direct-only (not supported by debrid providers)".into()),
+            true,
+        );
+    }
     struct Cand {
         p: Provider,
         m: HostMatch,
@@ -1540,10 +1570,21 @@ pub async fn download_via_debrid(
             }
         }
         // Direct path: fetch the node's (encrypted) download URL and
-        // decrypt while streaming to disk.
-        let (dl_url, _sz) = match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
-            Ok(v) => v,
+        // decrypt after completion. Ticket URLs expire, so engine
+        // resume state is keyed by folder+handle, not the ticket URL.
+        if let Ok(mut k) = ctrl.state_key.lock() {
+            *k = Some(format!("mega:{}:{}", folder.id, picked.handle));
+        }
+        ctrl.encrypted_payload
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut dl_url = match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
+            Ok((u, _)) => u,
             Err(e) => {
+                ctrl.encrypted_payload
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut k) = ctrl.state_key.lock() {
+                    *k = None;
+                }
                 let msg = match provider_err {
                     Some(pe) => format!("MEGA direct download failed: {e} (provider: {pe})"),
                     None => format!("MEGA direct download failed: {e}"),
@@ -1551,30 +1592,65 @@ pub async fn download_via_debrid(
                 return Err((msg, true));
             }
         };
-        task.url = dl_url.clone();
         task.debrid_info = format_debrid_info("MEGA direct", &url_host(&original_url), None);
-        if let Ok(mut l) = ctrl.live.lock() {
-            *l = Some(crate::engine::LiveInfo {
-                debrid_info: task.debrid_info.clone(),
-                resolved_url: dl_url.clone(),
-                final_url: String::new(),
-            });
-        }
         let debrid_info = task.debrid_info.clone();
         task.filename = crate::model::sanitize_filename(&picked.name);
-        let out_path = std::path::Path::new(&task.dest_dir).join(&task.filename);
-        let mut done = crate::engine::download_http_with_prewarm(
-            http,
-            task,
-            ctrl,
-            None,
-            settings.max_part_mb * 1024 * 1024,
-        )
-        .await
-        .map_err(|e| (e, false))?;
+        // Ticket-expiry loop: re-resolve + re-enter on sentinel; parts
+        // persist under state_key. Bounded at 4 rounds.
+        let mut engine_result = Err("ticket-expired: re-resolve required".to_string());
+        let mut task = task;
+        for _attempt in 0..4 {
+            task.url = dl_url.clone();
+            if let Ok(mut l) = ctrl.live.lock() {
+                *l = Some(crate::engine::LiveInfo {
+                    debrid_info: task.debrid_info.clone(),
+                    resolved_url: dl_url.clone(),
+                    final_url: String::new(),
+                });
+            }
+            engine_result = crate::engine::download_http_with_prewarm(
+                http.clone(),
+                task.clone(),
+                ctrl.clone(),
+                None,
+                settings.max_part_mb * 1024 * 1024,
+            )
+            .await;
+            match &engine_result {
+                Err(e) if e.contains("ticket-expired") => {
+                    match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
+                        Ok((u, _)) => {
+                            dl_url = u;
+                            continue;
+                        }
+                        Err(e2) => {
+                            engine_result = Err(e2);
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        ctrl.encrypted_payload
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut k) = ctrl.state_key.lock() {
+            *k = None;
+        }
+        let mut done = engine_result.map_err(|e| (e, false))?;
+        // Paused/cancelled: parts stay encrypted for resume; decrypt
+        // only on completion (done.filename is post-rename).
+        if done.status == crate::model::TaskStatus::Paused {
+            done.url = original_url;
+            done.debrid_info = debrid_info;
+            return Ok(done);
+        }
+        let out_path = std::path::Path::new(&done.dest_dir).join(&done.filename);
         // Decrypt the completed (still-encrypted) file in place.
         crate::mega::decrypt_file_in_place(&out_path, &picked.key)
             .map_err(|e| (format!("MEGA decryption failed: {e}"), true))?;
+        crate::engine::validate_output(&out_path, &done.filename)
+            .map_err(|e| (format!("invalid output after decryption: {e}"), true))?;
         done.url = original_url;
         done.debrid_info = debrid_info;
         done.debrided_url = dl_url;
@@ -1617,6 +1693,28 @@ pub async fn download_via_debrid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_drive_url_detection() {
+        assert!(is_google_drive_url(
+            "https://takeout-download-drive.usercontent.google.com/download/drive-download-20261026T143258Z-1-001.zip?j=x&i=0&user=1&authuser=0"
+        ));
+        assert!(is_google_drive_url(
+            "https://drive.google.com/file/d/abc123/view?usp=sharing"
+        ));
+        assert!(is_google_drive_url(
+            "https://drive.usercontent.google.com/download?id=abc"
+        ));
+        assert!(is_google_drive_url(
+            "https://lh3.googleusercontent.com/abc"
+        ));
+        assert!(!is_google_drive_url("https://example.com/file.zip"));
+        assert!(!is_google_drive_url(
+            "https://notdrive.google.com.evil.com/file.zip"
+        ));
+        assert!(!is_google_drive_url("https://google.com/search?q=x"));
+        assert!(!is_google_drive_url("magnet:?xt=urn:btih:abc"));
+    }
 
     #[test]
     fn provider_ids_and_order() {

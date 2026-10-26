@@ -522,12 +522,18 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never HTTP headers.
         // With a jar, Cookie comes from file; user Cookie header would duplicate/override.
+        // Denied wire headers (Range, accept-encoding, ...) are stack-owned
+        // or response/hop-by-hop names: yt-dlp must not replay them either.
         if YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
             || k.eq_ignore_ascii_case("x-page-url")
             || k.eq_ignore_ascii_case("x-page-title")
             || k.eq_ignore_ascii_case("x-page-stream")
             || k.eq_ignore_ascii_case("x-page-intent")
+            || k.eq_ignore_ascii_case("x-rep-id")
+            || k.eq_ignore_ascii_case("x-variant-index")
+            || k.eq_ignore_ascii_case("x-nzb")
             || (cookie_jar.is_some() && k.eq_ignore_ascii_case("cookie"))
+            || crate::engine::is_denied_wire_header(k)
         {
             continue;
         }
@@ -2329,6 +2335,32 @@ mod tests {
                 .any(|x| x.to_ascii_lowercase().starts_with("x-page-title")),
             "{a:?}"
         );
+    }
+
+    #[test]
+    fn base_args_strips_denied_and_pseudo_headers() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("Range".to_string(), "bytes=0-99".to_string());
+        h.insert("Accept-Encoding".to_string(), "gzip".to_string());
+        h.insert("Host".to_string(), "evil.example".to_string());
+        h.insert("X-Rep-Id".to_string(), "1".to_string());
+        h.insert("X-Variant-Index".to_string(), "2".to_string());
+        h.insert("X-Nzb".to_string(), "3".to_string());
+        h.insert("User-Agent".to_string(), "BrowserUA/1".to_string());
+        h.insert("Authorization".to_string(), "Bearer tok".to_string());
+        let t = crate::model::DownloadTask {
+            headers: h,
+            ..Default::default()
+        };
+        let a = base_args("https://example.com/v", &t, None);
+        for denied in ["Range:", "Accept-Encoding:", "Host:", "X-Rep-Id:", "X-Variant-Index:", "X-Nzb:"] {
+            assert!(
+                !a.iter().any(|x| x.to_ascii_lowercase().starts_with(&denied.to_ascii_lowercase())),
+                "{denied} leaked: {a:?}"
+            );
+        }
+        assert!(a.iter().any(|x| x.starts_with("User-Agent:")), "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("Authorization:")), "{a:?}");
     }
 
     #[test]

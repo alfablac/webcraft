@@ -90,7 +90,16 @@ impl Runtime {
     pub fn add_url(&mut self, url: &str, queue_id: &str, referrer: &str, cookies: &str) -> String {
         // Dedup exact URL: duplicate magnet = same librqbit handle shared by two
         // app tasks; removing one detaches other into never-finishing zombie.
-        if let Some(t) = self.state.tasks.iter().find(|t| t.url == url) {
+        // A re-add of the same URL with fresher browser/session material
+        // refreshes the existing task's referrer/cookies instead of letting
+        // a stale/expired capture keep winning.
+        if let Some(t) = self.state.tasks.iter_mut().find(|t| t.url == url) {
+            if !referrer.trim().is_empty() {
+                t.referrer = referrer.to_string();
+            }
+            if !cookies.trim().is_empty() {
+                t.cookies = cookies.to_string();
+            }
             return t.id.clone();
         }
         // NZB tasks produce NZB file names at download time; don't seed
@@ -270,8 +279,19 @@ fn parse_kv_file(path: &std::path::Path) -> Option<DownloadTask> {
                         ]
                         .iter()
                         .any(|x| name.eq_ignore_ascii_case(x));
-                    if !name.is_empty() && !v.is_empty() && !pseudo {
-                        t.headers.insert(name.to_string(), v.to_string());
+                    // Defensive caps mirror the host/extension (32 rows,
+                    // name <=64, value <=4096); denied wire names and
+                    // pseudo-headers never land on the task. Names are
+                    // lowercased so case variants can't coexist.
+                    if !name.is_empty()
+                        && !v.is_empty()
+                        && !pseudo
+                        && name.len() <= 64
+                        && v.len() <= 4096
+                        && !crate::engine::is_denied_wire_header(name)
+                        && t.headers.len() < 32
+                    {
+                        t.headers.insert(name.to_ascii_lowercase(), v.to_string());
                     }
                 }
                 _ => {}
@@ -696,7 +716,7 @@ pub fn take_inbox_tasks(rt: &Arc<Mutex<Runtime>>) -> Vec<DownloadTask> {
                     // page URL (+referrer/cookies), NOT a capture task.
                     let _ = std::fs::write(
                         platform::config_dir().join("pending-add.json"),
-                        serde_json::json!({"url": url_decode(enc), "referrer": t.referrer, "cookies": t.cookies, "cookiesJson": t.cookies_json}).to_string(),
+                        serde_json::json!({"url": url_decode(enc), "referrer": t.referrer, "cookies": t.cookies, "cookiesJson": t.cookies_json, "headers": t.headers}).to_string(),
                     );
                     let _ = std::fs::remove_file(&p);
                     continue;

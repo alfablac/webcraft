@@ -464,20 +464,26 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                             body.push_str(&format!("mime={v}\n"));
                         }
                     } else if k != "type" {
-                        body.push_str(&format!("{k}={v}\n"));
+                        // Generic KV values (referrer/cookies/cookiesJson/
+                        // queue) must not forge extra KV lines: CR/LF
+                        // values are dropped entirely.
+                        if !v.contains(['\n', '\r']) {
+                            body.push_str(&format!("{k}={v}\n"));
+                        }
                     }
                 }
             }
-            // Safe browser request headers (extension allowlist) flatten to
-            // header.<Name>=<value> lines; desktop parse_kv_file stores them
-            // on the task and the engine sends them. cookie/host/content-
-            // length are never flattened: cookies travel via `cookies`, the
-            // rest are set by the HTTP stack. Sanitized: CR/LF would forge
-            // extra KV lines, so such pairs are dropped; count/value capped.
+            // Browser request headers (extension denylist capture) flatten
+            // to header.<Name>=<value> lines; desktop parse_kv_file stores
+            // them on the task and the engine sends them. Stack-owned /
+            // hop-by-hop / conditional names are never flattened (the
+            // engine's send-time denylist is authoritative; this is
+            // defense in depth). Sanitized: CR/LF would forge extra KV
+            // lines, so such pairs are dropped; count/value capped.
             if let Some(hdrs) = msg.get("headers").and_then(|v| v.as_object()) {
                 let mut written = 0usize;
                 for (hn, hv) in hdrs {
-                    if written >= 8 {
+                    if written >= 32 {
                         break;
                     }
                     let hv = match hv.as_str() {
@@ -489,12 +495,34 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
                     if hn.is_empty()
                         || hv.is_empty()
                         || hn.len() > 64
-                        || hv.len() > 2048
+                        || hv.len() > 4096
                         || hn.contains(['\r', '\n', '='])
                         || hv.contains(['\r', '\n'])
-                        || hn.eq_ignore_ascii_case("cookie")
-                        || hn.eq_ignore_ascii_case("host")
-                        || hn.eq_ignore_ascii_case("content-length")
+                        || [
+                            "host",
+                            "content-length",
+                            "range",
+                            "accept-encoding",
+                            "content-encoding",
+                            "transfer-encoding",
+                            "expect",
+                            "connection",
+                            "keep-alive",
+                            "proxy-connection",
+                            "te",
+                            "trailer",
+                            "upgrade",
+                            "proxy-authorization",
+                            "set-cookie",
+                            "www-authenticate",
+                            "if-match",
+                            "if-none-match",
+                            "if-modified-since",
+                            "if-unmodified-since",
+                            "if-range",
+                        ]
+                        .iter()
+                        .any(|d| hn.eq_ignore_ascii_case(d))
                     {
                         continue;
                     }

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.25.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.25.1-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
   <a href="https://addons.mozilla.org/en-US/firefox/addon/webcraft/"><img alt="Firefox Add-on" src="https://img.shields.io/badge/Firefox-Add--on%20on%20AMO-FF7139?logo=firefoxbrowser&logoColor=white"></a>
@@ -20,7 +20,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.25.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.25.1 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -77,6 +77,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - TorBox: non-cached hoster links create a server-side web download; the app polls until TorBox reports it ready, then downloads, and surfaces server errors
 - Magnet results fan out to one task per file; hoster checks are cached so repeat adds start fast
 - The downloads list shows a Debrid badge and the progress dialog names the provider, hoster, and cache status — no silent fallbacks
+- transfer.it links (`https://transfer.it/t/<id>`): adding one enumerates the transfer and creates one task per file; each file downloads directly via MEGA's `cs/g` redirector, which serves server-side decrypted (plaintext) bytes with HTTP Range resume (debrid providers do not support transfer.it, so downloads are direct-only). Password-protected transfers fail with a clear error; invalid/expired links report "transfer not found"
 
 ### Video and playback
 

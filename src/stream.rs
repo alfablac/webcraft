@@ -201,7 +201,9 @@ pub fn proto_kind(task: &DownloadTask) -> ProtoKind {
 /// Probe Content-Type only (headers, body dropped). On any error/non-success -> File.
 /// ponytail: header-only probe misses manifests served as octet-stream/text; body-peek + reuse would need passing fetched text into download_dash/download_hls — add when such servers matter.
 async fn probe_manifest(client: &reqwest::Client, task: &DownloadTask) -> Manifest {
-    let req = client.get(&task.url).headers(engine::headers_for(task));
+    let req = client
+        .get(&task.url)
+        .headers(engine::headers_for_target(task, &task.url));
     let Ok(resp) = req.send().await else {
         return Manifest::File;
     };
@@ -297,6 +299,16 @@ pub async fn download_url_with_settings(
     settings: &Settings,
 ) -> Result<DownloadTask, String> {
     let lower = task.url.to_ascii_lowercase();
+    // transfer.it before the generic debrid gate: providers do not
+    // support transfer.it, so downloads are direct-only via
+    // `crate::transferit` (resolved natively, never debrid). Hard
+    // errors here return Err so the SPA shell HTML never saves as a
+    // fake file.
+    if crate::transferit::is_task_url(&task.url) {
+        return crate::transferit::download_transfer(client, task, ctrl, settings)
+            .await
+            .map_err(|(e, _hard)| e);
+    }
     // Debrid before torrent/HTTP: magnets + hoster URLs. Resolved direct
     // URLs expire/IP-bound, so resolution runs fresh here on every start
     // (same client = same egress IP); persisted task keeps original URL
@@ -319,8 +331,11 @@ pub async fn download_url_with_settings(
         // avoid hijacking normal HTTP by requiring hoster match attempt
         // only for non-manifest URLs. Failure falls through anyway, but
         // skip obvious manifests/video pages to save API calls.
-        let skip =
-            manifest_kind_from_url(&task.url).is_some() || crate::ytdlp::is_video_page(&task.url);
+        let skip = manifest_kind_from_url(&task.url).is_some()
+            || crate::ytdlp::is_video_page(&task.url)
+            // Google Drive: direct-only; debrid cannot unrestrict one-shot
+            // usercontent GETs and the attempt hard-fails the task.
+            || crate::debrid::is_google_drive_url(&task.url);
         if !skip {
             match crate::debrid::download_via_debrid(
                 client.clone(),
@@ -464,6 +479,24 @@ pub async fn download_url_with_settings(
             .await
             .map_err(|e| format!("yt-dlp failed: {e}"));
     }
+    // Direct archive/document URLs skip the manifest-sniff GET: it burns a
+    // full request on one-shot/non-resumable hosts (Drive takeout) and the
+    // body peek is dropped. Engine probe handles them directly.
+    let path_only = lower.split(['?', '#']).next().unwrap_or(&lower);
+    const DIRECT_FILE_EXTS: &[&str] = &[
+        ".zip", ".7z", ".rar", ".gz", ".bz2", ".xz", ".zst", ".tar", ".tgz", ".iso", ".img",
+        ".apk", ".exe", ".msi", ".dmg", ".deb", ".rpm", ".pdf",
+    ];
+    if DIRECT_FILE_EXTS.iter().any(|e| path_only.ends_with(e)) {
+        return engine::download_http_with_prewarm(
+            client,
+            task.clone(),
+            ctrl,
+            engine::prewarm_take(&task.url),
+            settings.max_part_mb * 1024 * 1024,
+        )
+        .await;
+    }
     match probe_manifest(&client, &task).await {
         Manifest::Metalink => {
             download_metalink(client, task, ctrl, settings.max_part_mb * 1024 * 1024).await
@@ -552,7 +585,9 @@ async fn fetch_text(
     task: &DownloadTask,
     url: &str,
 ) -> Result<String, String> {
-    let req = client.get(url).headers(engine::headers_for(task));
+    let req = client
+        .get(url)
+        .headers(engine::headers_for_target(task, url));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for {url}", resp.status()));
@@ -812,7 +847,9 @@ async fn fetch_key(
     task: &DownloadTask,
     url: &str,
 ) -> Result<[u8; 16], String> {
-    let req = client.get(url).headers(engine::headers_for(task));
+    let req = client
+        .get(url)
+        .headers(engine::headers_for_target(task, url));
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for key {url}", resp.status()));

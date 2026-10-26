@@ -2,6 +2,51 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.25.1] - 2026-10-26
+
+### Added
+
+- transfer.it support: adding an `https://transfer.it/t/<id>` link
+  lists the transfer (via the MEGA API it is backed by) and creates
+  one download task per file. Downloads are direct-only via MEGA's
+  `cs/g` redirector, which serves server-side decrypted (plaintext)
+  bytes with HTTP Range resume (debrid providers do not support
+  transfer.it). Password-protected transfers fail with a clear "not
+  supported yet" error instead of garbage output.
+
+- Browser captures now carry the browser's request headers (not just
+  User-Agent/Accept-Language/Authorization): both extensions capture
+  nearly all headers the browser sent (denylist: stack-owned and
+  hop-by-hop names only), Chromium via the `extraHeaders` listener so
+  Referer/Origin/languages are included, and the desktop sends them on
+  the download. Credentials stay origin-scoped: Authorization and
+  cookies are never replayed to a different host (Google Drive chain
+  excepted for cookies, over HTTPS only), and stack-owned headers
+  (`Range`, `Host`, `Accept-Encoding`, conditionals, …) are dropped at
+  send time everywhere, including yt-dlp. The capture dialog lists the
+  headers that will be sent.
+
+### Fixed
+
+- Google Drive links (incl. multi-file takeout zips from
+  `*.usercontent.google.com`) are direct-only: they no longer route
+  through debrid, whose fuzzy host matching claimed the takeout host
+  and hard-failed the task.
+- Non-resumable downloads (e.g. Drive takeout): the engine probe falls
+  back to a plain GET when a Range request is rejected, a 200 answer
+  to a segment Range request downgrades cleanly to single-stream, and
+  `.zip` output is validated against ZIP magic bytes.
+- Cookie-gated Drive downloads: captured session cookies survived HTTP
+  redirects (reqwest stripped them on cross-host hops, landing on a
+  Google sign-in page saved as HTML and rejected as
+  "playlist/HTML"); downloads now follow redirects manually,
+  re-applying the task headers each hop, and a Drive sign-in page fails
+  immediately with a clear "session cookies missing or expired"
+  message. `Cookie`/`Referer` header rows are honored when the
+  dedicated fields are empty, re-adding a URL refreshes a task's
+  cookies, and the browser extensions read cookies from the tab's own
+  cookie store (Firefox containers/private).
+
 ## [0.25.0] - 2026-10-24
 
 ### Added

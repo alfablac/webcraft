@@ -22,6 +22,51 @@ pub fn build_client(proxy: &str) -> reqwest::Client {
     b.build().unwrap_or_default()
 }
 
+/// Like [`build_client`] but with NO auto-redirect following and no
+/// cookie jar. The manual redirect loop in this module re-applies `Cookie`
+/// (and the task's other wire headers) on every hop; reqwest's default
+/// redirect handling strips `Cookie`/`Authorization` on any cross-host
+/// hop (Google Drive's chain through a different host loses all session
+/// cookies and lands on a sign-in page). Derived into a `no_redirect`
+/// client that shares the same proxy/egress by [`no_redirect_client`].
+pub fn build_client_no_redirect(proxy: &str) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        .user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(20))
+        .pool_max_idle_per_host(8)
+        .redirect(reqwest::redirect::Policy::none());
+    if !proxy.trim().is_empty() {
+        if let Ok(p) = reqwest::Proxy::all(proxy.trim()) {
+            b = b.proxy(p);
+        }
+    }
+    b.build().unwrap_or_default()
+}
+
+/// Manual redirects need a no-redirect twin that mirrors the caller's
+/// client exactly. [`build_client`] twins are cached per proxy; callers
+/// built with anything else will get an equivalent UA (same crate
+/// version) — acceptable: every app download/probe site builds via
+/// `build_client` with the task's effective proxy, so twins share egress
+/// and User-Agent. A caller that built its client with a custom UA would
+/// see webcraft's UA on twin hops — still a valid browser-ish fallback,
+/// and sites that check UA consistency mid-chain are rare. Keeps the
+/// engine free of client-pointer registries.
+fn no_redirect_client(task: &DownloadTask) -> reqwest::Client {
+    static TWINS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    > = std::sync::OnceLock::new();
+    let cache = TWINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(task.proxy_url.clone())
+        .or_insert_with(|| build_client_no_redirect(task.proxy_url.trim()))
+        .clone()
+}
+
 /// Minimal RFC 4648 base64 (no dep for one header).
 fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -45,15 +90,137 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-/// Wire headers for HTTP(S) requests, in precedence order:
-/// (1) `task.headers` rows EXCLUDING Cookie/Referer (invalid name/value
-/// dropped, pseudo-headers stripped), (2) Referer from `task.referrer`,
-/// (3) Cookie from `task.cookies`. The referrer/cookies fields are the
-/// canonical browser/manual values, so they WIN over Cookie/Referer rows
-/// in `task.headers`. Then Basic auth unless Authorization already present.
+/// Headers that must never be replayed from `task.headers` on the wire:
+/// stack-owned (Host/Content-Length/Range), encoding, hop-by-hop, request
+/// conditionals, and response-only names. Replaying `Accept-Encoding` is
+/// actively harmful here: the reqwest build negotiates no compression
+/// (`Cargo.toml` reqwest has no gzip/brotli/deflate), so compressed bytes
+/// would be written to disk and ranged offsets would break. Shared by the
+/// engine, yt-dlp args, host flattening, and the app's header-row check so
+/// every layer enforces the same policy.
+pub fn is_denied_wire_header(name: &str) -> bool {
+    let n = name.trim();
+    [
+        "host",
+        "content-length",
+        "range",
+        "accept-encoding",
+        "content-encoding",
+        "transfer-encoding",
+        "expect",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "upgrade",
+        "proxy-authorization",
+        "set-cookie",
+        "www-authenticate",
+    ]
+    .iter()
+    .any(|d| n.eq_ignore_ascii_case(d))
+        || [
+            "if-match",
+            "if-none-match",
+            "if-modified-since",
+            "if-unmodified-since",
+            "if-range",
+        ]
+        .iter()
+        .any(|d| n.eq_ignore_ascii_case(d))
+}
+
+/// Origin of a URL as (scheme, host, port) with default ports resolved.
+/// `None` on unparseable/non-HTTP input. Port 443/https and 80/http
+/// normalize so same-origin checks survive explicit default ports.
+fn url_origin(url: &str) -> Option<(String, String, u16)> {
+    let u = reqwest::Url::parse(url.trim()).ok()?;
+    let scheme = u.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = u.host_str()?.to_ascii_lowercase();
+    let port = u
+        .port()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Some((scheme, host, port))
+}
+
+/// Drive cookie-exception hosts: cookies may cross to these over https
+/// (Google's download chain bounces drive <-> usercontent). Authorization
+/// NEVER crosses, even here.
+fn is_drive_cookie_host(host: &str) -> bool {
+    host == "google.com"
+        || host.ends_with(".google.com")
+        || host == "googleusercontent.com"
+        || host.ends_with(".googleusercontent.com")
+        || host == "usercontent.google.com"
+        || host.ends_with(".usercontent.google.com")
+}
+
+/// Same origin as `task.url`. When either URL does not parse (legacy
+/// tasks/tests with an empty URL), only an exact own-URL match counts —
+/// fail-closed for anything else.
+fn same_origin(task: &DownloadTask, target: &str) -> bool {
+    match (url_origin(&task.url), url_origin(target)) {
+        (Some(from), Some(to)) => from == to,
+        _ => task.url.trim() == target.trim(),
+    }
+}
+
+/// Cookie may be sent from `task` (origin = `task.url`) to `target`:
+/// same origin, or the Drive exception (https only, Google hosts only).
+pub(crate) fn cookie_allowed_for_target(task: &DownloadTask, target: &str) -> bool {
+    if same_origin(task, target) {
+        return true;
+    }
+    match url_origin(target) {
+        Some(to) => to.0 == "https" && is_drive_cookie_host(&to.1),
+        None => false,
+    }
+}
+
+/// Authorization (row or synthesized Basic) may be sent to `target`:
+/// strictly same origin as `task.url`, no https->http downgrade (a
+/// downgrade is a different origin anyway once the scheme differs).
+pub(crate) fn auth_allowed_for_target(task: &DownloadTask, target: &str) -> bool {
+    same_origin(task, target)
+}
+
+/// Whether redirect-hop `Set-Cookie` values from `hop_url` may be merged
+/// into the session cookie: same-origin hops, plus Drive-exception hops.
+pub(crate) fn set_cookie_merge_allowed(task: &DownloadTask, hop_url: &str) -> bool {
+    cookie_allowed_for_target(task, hop_url)
+}
+
+/// Wire headers for HTTP(S) requests to the task's OWN url (same-origin
+/// by definition — see [`headers_for_target`]). Precedence:
+/// (1) `task.headers` rows EXCLUDING denied/pseudo/Cookie/Referer rows,
+/// (2) Referer from `task.referrer` (row fallback), (3) Cookie from
+/// `task.cookies` (row fallback). Dedicated fields WIN over rows. Then
+/// Basic auth unless Authorization already present.
 /// Single source for engine + stream fetches (FTP/SFTP ignore headers).
+/// Used by tests and any same-origin caller; most call sites should use
+/// [`headers_for_target`] with the actual request URL.
+#[allow(dead_code)]
 pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
+    headers_for_target(task, &task.url)
+}
+
+/// Wire headers for a request to `target_url`, with credentials scoped:
+/// `Authorization` and `Cookie`/`Cookie2` are sent ONLY when allowed for
+/// the target (same origin as `task.url`; Cookie additionally gets the
+/// Drive https exception). All other rows follow the same precedence as
+/// [`headers_for`]. `Referer` is not origin-scoped (browsers send it
+/// cross-origin by design; downloaders need it for hotlink checks).
+pub(crate) fn headers_for_target(
+    task: &DownloadTask,
+    target_url: &str,
+) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
+    let auth_ok = auth_allowed_for_target(task, target_url);
+    let cookie_ok = cookie_allowed_for_target(task, target_url);
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never sent on wire.
         if crate::ytdlp::YT_HEADER_KEYS
@@ -69,8 +236,17 @@ pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
         {
             continue;
         }
+        if is_denied_wire_header(k) {
+            continue;
+        }
         // Cookie/Referer rows lose to the dedicated fields applied below.
-        if k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("referer") {
+        if k.eq_ignore_ascii_case("cookie")
+            || k.eq_ignore_ascii_case("cookie2")
+            || k.eq_ignore_ascii_case("referer")
+        {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("authorization") && !auth_ok {
             continue;
         }
         if let (Ok(n), Ok(vv)) = (k.parse::<reqwest::header::HeaderName>(), v.parse()) {
@@ -82,18 +258,246 @@ pub(crate) fn headers_for(task: &DownloadTask) -> reqwest::header::HeaderMap {
             h.insert(reqwest::header::REFERER, v);
         }
     }
-    if !task.cookies.is_empty() {
+    if cookie_ok && !task.cookies.is_empty() {
         if let Ok(v) = task.cookies.parse() {
             h.insert(reqwest::header::COOKIE, v);
         }
     }
-    if !task.username.is_empty() && !h.contains_key(reqwest::header::AUTHORIZATION) {
+    if auth_ok && !task.username.is_empty() && !h.contains_key(reqwest::header::AUTHORIZATION) {
         let raw = format!("{}:{}", task.username, task.password);
         if let Ok(v) = format!("Basic {}", b64(raw.as_bytes())).parse() {
             h.insert(reqwest::header::AUTHORIZATION, v);
         }
     }
+    // Cookie/Referer rows are canonical-field fallbacks: dedicated fields
+    // (applied above) win, rows apply only when the field is empty. This
+    // covers pasted `Cookie: ...` headers that previously died silently.
+    if cookie_ok && task.cookies.trim().is_empty() {
+        if let Some((_, v)) = task.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+            if let Ok(v) = v.trim().parse() {
+                h.insert(reqwest::header::COOKIE, v);
+            }
+        }
+    }
+    if task.referrer.trim().is_empty() {
+        if let Some((_, v)) = task.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")) {
+            if let Ok(v) = v.trim().parse() {
+                h.insert(reqwest::header::REFERER, v);
+            }
+        }
+    }
     h
+}
+
+/// True for Google Drive / usercontent download URLs: the one-shot
+/// takeout zip and share-download links that redirect cross-host before
+/// serving bytes. Delegates to `crate::debrid::is_google_drive_url` —
+/// single source for which hosts are Drive-direct-only.
+pub fn is_drive_url(url: &str) -> bool {
+    crate::debrid::is_google_drive_url(url)
+}
+
+/// True when any redirect hop should carry the task's captured Cookie &
+/// other sensitive wire headers: the task URL is a Drive URL or the
+/// `headers` carry a Cookie row (dedicated `cookies` field or a header
+/// row). Cookie rows are skipped by `headers_for`, so a row signals the
+/// user/agent put cookies in the headers editor — worth honoring.
+pub(crate) fn needs_cookie_redirect(url: &str, task: &DownloadTask) -> bool {
+    is_drive_url(url)
+        || task
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("cookie"))
+}
+
+/// Plan the next manual-redirect URL. `None` = final response (status
+/// not a redirect, or no Location). Errors on malformed/overshot hops.
+/// Hop cap is generous (Google chains 3-5) and mirrors reqwest's default.
+pub(crate) fn redirect_next_url(
+    status: u16,
+    location: &str,
+    current: &str,
+    hop: u32,
+) -> Result<Option<String>, String> {
+    if hop >= REDIRECT_HOP_LIMIT {
+        return Err("too many redirects".into());
+    }
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+    let base = reqwest::Url::parse(current).map_err(|e| e.to_string())?;
+    let next = base.join(location).map_err(|e| e.to_string())?;
+    match next.scheme() {
+        "http" | "https" => Ok(Some(next.to_string())),
+        other => Err(format!("unsupported redirect scheme: {other}")),
+    }
+}
+
+pub const REDIRECT_HOP_LIMIT: u32 = 10;
+
+/// Google sign-in wall: response whose final URL or type shows the
+/// session never made it (cookie missing/expired) OR a top-level
+/// sign-in/account-chooser page came back for a file URL. Checked on the
+/// resolved final response of Drive URLs — Drive never serves HTML for a
+/// valid file download. Both sides must hold: Drive origin task + HTML
+/// final page.
+pub(crate) fn is_drive_signin_page(task_url: &str, final_url: &str, content_type: Option<&str>) -> bool {
+    if !is_drive_url(task_url) {
+        return false;
+    }
+    let ct = content_type
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let fh = crate::debrid::url_host(final_url);
+    let final_is_signin_host = fh == "accounts.google.com"
+        || fh == "drive.google.com"
+        || final_url.contains("/signin")
+        || final_url.contains("/ServiceLogin")
+        || final_url.contains("/AccountChooser")
+        || final_url.contains("/confirmidentifier");
+    let ct_html = ct == "text/html";
+    // is_google_drive_url matches drive.google.com itself, so a share
+    // PAGE task URL serving HTML is fine — only downloads whose final
+    // page is a sign-in host OR an HTML file page get refused. Both
+    // arms require HTML or a sign-in landing.
+    final_is_signin_host || ct_html
+}
+
+pub const DRIVE_COOKIES_EXPIRED: &str = "Google returned a sign-in page instead of the file — session cookies missing or expired; re-download from the browser so webcraft captures fresh cookies";
+
+/// Merge fresh `Set-Cookie` values into a raw Cookie header value:
+/// same-name values are replaced, new names appended, unrelated existing
+/// pairs preserved verbatim. Never logs cookie values.
+pub(crate) fn merge_cookies_header(existing: &str, set_cookies: &[String]) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for seg in existing.split(';') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let (n, v) = seg
+            .split_once('=')
+            .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
+            .unwrap_or_else(|| (seg.to_string(), String::new()));
+        pairs.push((n, v));
+    }
+    for sc in set_cookies {
+        let first = sc.split(';').next().unwrap_or("").trim();
+        let Some((n, v)) = first.split_once('=') else {
+            continue;
+        };
+        let (n, v) = (n.trim(), v.trim());
+        if n.is_empty() {
+            continue;
+        }
+        if let Some(slot) = pairs.iter_mut().find(|(en, _)| en == n) {
+            slot.1 = v.to_string();
+        } else {
+            pairs.push((n.to_string(), v.to_string()));
+        }
+    }
+    pairs
+        .iter()
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Follow a GET manually, re-applying the task's wire headers and Range
+/// on every hop so captured cookies survive cross-host redirects.
+/// When `needs_cookie_redirect` is false, behaves identically to a plain
+/// `client.get(...).send()` (reqwest's own redirect policy untouched —
+/// the twin is only used for cookie-carrying requests). Never logs URLs
+/// with query strings beyond status/host via the caller.
+pub(crate) async fn send_with_cookie_redirects(
+    client: &reqwest::Client,
+    task: &DownloadTask,
+    url: &str,
+    range: Option<(u64, Option<u64>)>,
+) -> Result<reqwest::Response, String> {
+    if !needs_cookie_redirect(url, task) {
+        let mut req = client.get(url).headers(headers_for_target(task, url));
+        if let Some((start, end)) = range {
+            req = req.header("Range", range_header_value(start, end));
+        }
+        return req.send().await.map_err(|e| e.to_string());
+    }
+    let twin = no_redirect_client(task);
+    let mut current = url.to_string();
+    let mut hops: u32 = 0;
+    let mut cookie_override: Option<String> = None;
+    loop {
+        // Per-hop headers: credentials are re-scoped to THIS hop's origin
+        // on every redirect, not just attached to the first request.
+        let mut hdrs = headers_for_target(task, &current);
+        // Merged Set-Cookie values from an earlier hop ride only where
+        // cookies are allowed for the current hop (same scoping rule).
+        if cookie_allowed_for_target(task, &current) {
+            if let Some(c) = &cookie_override {
+                if let Ok(v) = c.parse() {
+                    hdrs.insert(reqwest::header::COOKIE, v);
+                }
+            }
+        }
+        let mut req = twin.get(&current).headers(hdrs);
+        if let Some((start, end)) = range {
+            req = req.header("Range", range_header_value(start, end));
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        // Refresh cookies from intermediate redirects (Google rotates
+        // SIDCC etc. mid-chain); next hop must send them.
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+            .collect();
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let status = resp.status().as_u16();
+        let next = match location {
+            Some(loc) => redirect_next_url(status, &loc, &current, hops)?,
+            None => None,
+        };
+        match next {
+            Some(u) => {
+                // Only merge Set-Cookie from hops cookies may come from
+                // (same origin, or Drive-exception hosts): a third-party
+                // bounce must not poison the session cookie.
+                if !set_cookies.is_empty() && set_cookie_merge_allowed(task, &current) {
+                    let base = cookie_override
+                        .take()
+                        .or_else(|| {
+                            headers_for_target(task, &current)
+                                .get(reqwest::header::COOKIE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default();
+                    cookie_override = Some(merge_cookies_header(&base, &set_cookies));
+                }
+                current = u;
+                hops += 1;
+                drop(resp);
+                continue;
+            }
+            None => return Ok(resp),
+        }
+    }
+}
+
+fn range_header_value(start: u64, end: Option<u64>) -> String {
+    match end {
+        Some(e) => format!("bytes={start}-{e}"),
+        None => format!("bytes={start}-"),
+    }
 }
 
 /// Download progress phases (Controls::phase).
@@ -132,6 +536,21 @@ pub struct Controls {
     /// manifest downloads use segment counts and set `parts_are_segments`.
     /// Multi-file NZB: one entry per file (bytes, flag false); single-file
     /// NZB keeps segment-count convention (flag true).
+    /// Encrypted payload flag (MEGA/transfer.it direct downloads): the
+    /// engine must NOT run magic-sniff `validate_output` on the
+    /// still-encrypted bytes — media files would hard-fail `invalid output`.
+    /// The caller decrypts after completion and validates afterwards.
+    pub encrypted_payload: AtomicBool,
+    /// Set when a Range request returns 200 (server ignores Range after
+    /// an earlier 206 probe, e.g. Drive takeout): segmented path must
+    /// abandon parts and let `download_http_with_prewarm` re-enter as a
+    /// single-stream plain download instead of exhausting retries.
+    pub ranges_ignored: AtomicBool,
+    /// Stable resume identity for downloads behind expiring ticket URLs
+    /// (MEGA `a=g` tickets rotate): when set, resume state is keyed by
+    /// this value instead of the fetch URL, so a fresh ticket still
+    /// resumes existing parts. Ticket URLs are never persisted.
+    pub state_key: std::sync::Mutex<Option<String>>,
     pub parts: std::sync::Mutex<Vec<(u64, u64)>>,
     /// Torrent files aligned 1:1 with `parts`: (librqbit index, relative path).
     /// All torrent files published, unselected included (progress checkboxes);
@@ -317,6 +736,9 @@ impl Controls {
             limit_kbps: AtomicU64::new(limit),
             rate: std::sync::Mutex::new((std::time::Instant::now(), 0, None, 0, 0.0)),
             total: AtomicU64::new(0),
+            encrypted_payload: AtomicBool::new(false),
+            ranges_ignored: AtomicBool::new(false),
+            state_key: std::sync::Mutex::new(None),
             parts: std::sync::Mutex::new(Vec::new()),
             part_files: std::sync::Mutex::new(Vec::new()),
             desired_files: std::sync::Mutex::new(None),
@@ -977,9 +1399,24 @@ pub fn dedup_dest(dest: &Path, incoming_size: Option<u64>) -> PathBuf {
 
 /// Prewarm: probe now (dialog open) so confirm -> first byte skips
 /// probe round-trip. Result has no body: response dropped after headers.
+/// An HTML probe result for a file-typed URL (extension in the filename
+/// or the URL path) is refused here so it is never cached: caching an
+/// HTML sign-in/error page poisons total/filename for 120 s and the
+/// eventual download streams it. `probe` itself still returns it for
+/// page-like tasks.
 pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<CachedProbe, String> {
     let mut p = probe(client, task).await?;
     let _ = p.body.take();
+    if let Some(ct) = p.content_type.as_deref() {
+        let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if ct == "text/html"
+            && (is_zip_family_name(&task.filename)
+                || is_zip_family_name(&p.final_url)
+                || is_drive_url(&task.url))
+        {
+            return Err(DRIVE_COOKIES_EXPIRED.to_string());
+        }
+    }
     Ok(CachedProbe {
         url: task.url.clone(),
         final_url: p.final_url,
@@ -993,14 +1430,186 @@ pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<Ca
     })
 }
 
+/// Kept for the Range-probe error classification contract (status 400-599
+/// is retryable as plain GET). `send_with_cookie_redirects` flattens
+/// network errors to String, so the status is unavailable in `probe`;
+/// tests pin the mapping directly.
+#[allow(dead_code)]
+pub(crate) fn status_from_range_error(error: &reqwest::Error) -> Option<u16> {
+    error.status().map(|status| status.as_u16())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProbeFallbackPlan {
+    pub(crate) status: u16,
+    pub(crate) retry_plain: bool,
+}
+
+pub(crate) fn probe_fallback_plan(range_error: Option<u16>) -> Option<ProbeFallbackPlan> {
+    let status = range_error?;
+    if (400..=599).contains(&status) && status != 416 {
+        Some(ProbeFallbackPlan {
+            status,
+            retry_plain: true,
+        })
+    } else {
+        None
+    }
+}
+
+/// Early Drive wall check on a probe/final response: keep from streaming
+/// a Google sign-in/account-chooser HTML page as if it were file bytes.
+/// ZIP-family only by URL/filename extension — Drive share pages and
+/// viewer links serve HTML legitimately and are direct-only anyway, so
+/// they fail elsewhere; a `.zip` task getting HTML is the gated one-shot
+/// zip expiring/missing cookies.
+fn drive_signin_error(task: &DownloadTask, final_url: &str, content_type: Option<&str>) -> Option<String> {
+    if !is_drive_url(&task.url) {
+        return None;
+    }
+    if !crate::engine::is_zip_family_name(&task.filename)
+        && !crate::engine::is_zip_family_name(final_url)
+    {
+        return None;
+    }
+    if is_drive_signin_page(&task.url, final_url, content_type) {
+        return Some(DRIVE_COOKIES_EXPIRED.to_string());
+    }
+    None
+}
+
+/// True for ZIP-family filenames (archive/document extensions validated
+/// by magic in `validate_output`).
+pub(crate) fn is_zip_family_name(name: &str) -> bool {
+    const ZIP_EXTS: &[&str] = &[
+        "zip", "jar", "apk", "xpi", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp", "cbz",
+    ];
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // URL may carry query strings; fall back to raw tail segment.
+    if ext.is_empty() {
+        let tail = name
+            .rsplit(['.', '/', '?', '&'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return ZIP_EXTS.contains(&tail.as_str());
+    }
+    ZIP_EXTS.contains(&ext.as_str())
+}
+
+fn probe_from_plain_response(resp: reqwest::Response, task: &DownloadTask) -> Result<Probe, String> {
+    if let Some(e) = drive_signin_error(
+        task,
+        resp.url().as_ref(),
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return Err(e);
+    }
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let lm = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let final_url = resp.url().to_string();
+    let content_disposition = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let total = resp.content_length();
+    Ok(Probe {
+        total,
+        accept_ranges: false,
+        body: Some(resp),
+        etag,
+        last_modified: lm,
+        final_url,
+        content_disposition,
+        content_type,
+    })
+}
+
+fn plain_total(resp: &reqwest::Response, known_total: Option<u64>) -> Option<u64> {
+    resp.content_length().or(known_total)
+}
+
+pub(crate) fn check_plain_complete(written: u64, expected: Option<u64>) -> Result<(), String> {
+    match expected {
+        Some(total) if written < total => Err(format!(
+            "incomplete download: got {written} of {total} bytes"
+        )),
+        Some(total) if written > total => Err(format!(
+            "size mismatch: got {written} bytes, expected {total}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn range_response_action(status: u16, has_body_started: bool) -> RangeResponseAction {
+    if status == 429 {
+        RangeResponseAction::Throttled
+    } else if status == 206 {
+        RangeResponseAction::Range
+    } else if status == 200 && !has_body_started {
+        RangeResponseAction::RangesIgnored
+    } else {
+        RangeResponseAction::Error
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RangeResponseAction {
+    Range,
+    Throttled,
+    RangesIgnored,
+    Error,
+}
+
+/// Probe uses a one-byte Range request. Some one-shot download endpoints
+/// (notably Google Drive's takeout usercontent host) reject Range requests
+/// even though a browser-style plain GET succeeds. Only a non-success Range
+/// response falls back; network errors remain errors. The caller keeps the
+/// plain response body and streams it without a second body request.
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
-    let resp = client
-        .get(&task.url)
-        .headers(headers_for(task))
-        .header("Range", "bytes=0-0")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let range_result = send_with_cookie_redirects(client, task, &task.url, Some((0, Some(0)))).await;
+    let resp = match range_result {
+        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => resp,
+        Ok(resp) => {
+            let plan = probe_fallback_plan(Some(resp.status().as_u16()))
+                .ok_or_else(|| format!("HTTP {}", resp.status()))?;
+            drop(resp);
+            let plain = send_with_cookie_redirects(client, task, &task.url, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !plain.status().is_success() {
+                return Err(format!(
+                    "Range probe failed (HTTP {}); plain GET failed (HTTP {})",
+                    plan.status,
+                    plain.status()
+                ));
+            }
+            return probe_from_plain_response(plain, task);
+        }
+        Err(error) => {
+            return Err(error);
+        }
+    };
     let status = resp.status();
     let etag = resp
         .headers()
@@ -1046,6 +1655,12 @@ pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Prob
     } else if status.is_success() {
         // Server ignored Range: 200 body IS whole file. Hand live response to
         // plain path in download_http — never drain here, never re-GET.
+        // Drive sign-in page (200 HTML for a .zip) must fail NOW, not
+        // stream to disk and fail post-download validation.
+        if let Some(e) = drive_signin_error(task, &final_url, content_type.as_deref()) {
+            drop(resp);
+            return Err(e);
+        }
         let total = resp.content_length();
         Ok(Probe {
             total,
@@ -1085,9 +1700,10 @@ fn state_path_for(part_dir: &Path) -> PathBuf {
 /// Serializes concurrent save_state writers (8 workers checkpointing same
 /// file raced non-atomically -> torn JSON -> whole resume discarded).
 static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn save_state(
+fn save_state_with_key(
     part_dir: &Path,
     url: &str,
+    state_key: &str,
     etag: &Option<String>,
     total: u64,
     segs: &[SegmentState],
@@ -1097,7 +1713,7 @@ fn save_state(
         .filter(|s| !s.merged)
         .map(|s| serde_json::json!({"start":s.start,"end":s.end,"done":s.done}))
         .collect();
-    let j = serde_json::json!({"url":url,"etag":etag,"total":total,"segments":v});
+    let j = serde_json::json!({"url":url,"state_key":state_key,"etag":etag,"total":total,"segments":v});
     // Atomic: tmp + rename, serialized. Torn state.json = resume lost.
     let _g = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dst = state_path_for(part_dir);
@@ -1105,6 +1721,17 @@ fn save_state(
     if std::fs::write(&tmp, j.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, &dst);
     }
+}
+
+/// Resume-identity check: a saved state resumes when its stored key
+/// matches `key` (both non-empty), else by URL equality. The
+/// `state_key` path lets expiring ticket URLs rotate without losing
+/// parts; the URL fallback keeps legacy states resumable.
+pub(crate) fn state_matches(saved_url: Option<&str>, saved_key: Option<&str>, fetch_url: &str, task_url: &str, key: &str) -> bool {
+    if !key.is_empty() && saved_key == Some(key) {
+        return true;
+    }
+    saved_url == Some(fetch_url) || saved_url == Some(task_url)
 }
 
 /// Segmented HTTP download with resume. Segment files: part{i} in dest_dir/.downloadcraft-{id}/
@@ -1118,6 +1745,44 @@ pub async fn download_http(
 
 // `max_part`: max part bytes override; 0 = auto (see `effective_max_part`).
 pub async fn download_http_with_prewarm(
+    client: reqwest::Client,
+    task: DownloadTask,
+    ctrl: Arc<Controls>,
+    prewarm: Option<CachedProbe>,
+    max_part: u64,
+) -> Result<DownloadTask, String> {
+    let task = Box::pin(download_http_inner(
+        client.clone(),
+        task,
+        ctrl.clone(),
+        prewarm,
+        max_part,
+    ))
+    .await?;
+    if ctrl.ranges_ignored.load(Ordering::Relaxed) {
+        // Server answered a Range request with 200 after claiming ranges
+        // in the probe. Parts are unusable; restart once as single-stream.
+        ctrl.ranges_ignored.store(false, Ordering::Relaxed);
+        let _ = tokio::fs::remove_dir_all(
+            task.dest_dir.join(format!(".downloadcraft-{}", task.id)),
+        )
+        .await;
+        ctrl.downloaded.store(0, Ordering::Relaxed);
+        ctrl.total.store(0, Ordering::Relaxed);
+        if let Ok(mut parts) = ctrl.parts.lock() {
+            parts.clear();
+        }
+        let mut retry = task.clone();
+        retry.total = None;
+        retry.accept_ranges = Some(false);
+        retry.downloaded = 0;
+        retry.status = crate::model::TaskStatus::Queued;
+        return Box::pin(download_http_inner(client, retry, ctrl, None, max_part)).await;
+    }
+    Ok(task)
+}
+
+async fn download_http_inner(
     client: reqwest::Client,
     mut task: DownloadTask,
     ctrl: Arc<Controls>,
@@ -1198,10 +1863,10 @@ pub async fn download_http_with_prewarm(
             None => {
                 let mut waits = 0u32;
                 loop {
-                    let r = client
-                        .get(&fetch_url)
-                        .headers(headers_for(&task))
-                        .send()
+                    // fetch_url is probe.final_url (already resolved);
+                    // cookie-redirect sender passes through when the URL
+                    // no longer needs the manual loop, else re-walks it.
+                    let r = send_with_cookie_redirects(&client, &task, &fetch_url, None)
                         .await
                         .map_err(|e| e.to_string())?;
                     if r.status().as_u16() == 429 && waits < 12 {
@@ -1217,17 +1882,14 @@ pub async fn download_http_with_prewarm(
             // Probe body itself throttled: wait once, refetch plain.
             let ra = retry_after_secs(resp.headers());
             wait_backoff(&ctrl, ra).await?;
-            resp = client
-                .get(&fetch_url)
-                .headers(headers_for(&task))
-                .send()
+            resp = send_with_cookie_redirects(&client, &task, &fetch_url, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-        task.total = resp.content_length().or(task.total);
+        task.total = plain_total(&resp, task.total);
         if let Some(t) = task.total {
             ctrl.total.store(t, Ordering::Relaxed);
             ctrl.parts_are_segments.store(false, Ordering::Relaxed);
@@ -1274,10 +1936,19 @@ pub async fn download_http_with_prewarm(
             }
         }
         file.flush().await.map_err(|e| e.to_string())?;
+        if let Err(e) = check_plain_complete(n, task.total) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
         drop(file);
         // Validate temp BEFORE dedup/rename: on failure delete temp only —
         // final dest (pre-existing/other-task file) stays untouched.
-        let vdest = match validate_output(&tmp, &task.filename) {
+        // Encrypted payloads skip sniffing (caller decrypts + validates).
+        let vdest = match if ctrl.encrypted_payload.load(Ordering::Relaxed) {
+            Ok(n)
+        } else {
+            validate_output(&tmp, &task.filename)
+        } {
             Ok(_) => {
                 let dest = dedup_dest(&dest, Some(n));
                 if let Some(name) = dest.file_name().map(|s| s.to_string_lossy().into_owned()) {
@@ -1316,7 +1987,12 @@ pub async fn download_http_with_prewarm(
         };
         // vdest already validated pre-rename (TsInMp4 remuxed there); this
         // gate only re-checks the renamed file, no quarantine (dest is ours).
-        match validate_output(&vdest, &task.filename) {
+        // Encrypted payloads skip sniffing (caller decrypts + validates).
+        match if ctrl.encrypted_payload.load(Ordering::Relaxed) {
+            Ok(n)
+        } else {
+            validate_output(&vdest, &task.filename)
+        } {
             Ok(_) => {}
             Err(ValidateFail::TsInMp4) => {
                 let final_path = ensure_mp4_or_ts(&vdest).await?;
@@ -1354,8 +2030,17 @@ pub async fn download_http_with_prewarm(
                     .map(|s| s.to_string())
                     == probe.etag
                     || probe.etag.is_none();
-                if (v.get("url").and_then(|u| u.as_str()) == Some(fetch_url.as_str())
-                    || v.get("url").and_then(|u| u.as_str()) == Some(task.url.as_str()))
+                if state_matches(
+                    v.get("url").and_then(|u| u.as_str()),
+                    v.get("state_key").and_then(|k| k.as_str()),
+                    &fetch_url,
+                    &task.url,
+                    ctrl.state_key
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_deref()
+                        .unwrap_or(""),
+                )
                     && v.get("total").and_then(|t| t.as_u64()) == Some(total)
                     && etag_ok
                 {
@@ -1502,13 +2187,29 @@ pub async fn download_http_with_prewarm(
             }
         }));
     }
+    let mut segment_error: Option<String> = None;
     for h in handles {
         match h.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if ctrl.cancelled.load(Ordering::Relaxed) || e == "cancelled" => {}
-            Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(e.to_string()),
+            Ok(Err(e)) => {
+                if segment_error.is_none() {
+                    segment_error = Some(e);
+                }
+            }
+            Err(e) => {
+                if segment_error.is_none() {
+                    segment_error = Some(e.to_string());
+                }
+            }
         }
+    }
+    if ctrl.ranges_ignored.load(Ordering::Relaxed) {
+        task.downloaded = ctrl.downloaded.load(Ordering::Relaxed);
+        return Ok(task);
+    }
+    if let Some(e) = segment_error {
+        return Err(e);
     }
     if ctrl.cancelled.load(Ordering::Relaxed) {
         task.status = TaskStatus::Paused;
@@ -1560,7 +2261,12 @@ pub async fn download_http_with_prewarm(
     ctrl.phase.store(PHASE_FINALIZING, Ordering::Relaxed);
     // Validate assembled temp BEFORE dedup/rename: on failure delete temp
     // only — final dest (pre-existing/other-task file) stays untouched.
-    match validate_output(&tmp, &task.filename) {
+    // Encrypted payloads skip sniffing (caller decrypts + validates).
+    match if ctrl.encrypted_payload.load(Ordering::Relaxed) {
+        Ok(total)
+    } else {
+        validate_output(&tmp, &task.filename)
+    } {
         Ok(_) => {}
         Err(ValidateFail::TsInMp4) => {
             let fixed = ensure_mp4_or_ts_validated(&tmp).await?;
@@ -1654,7 +2360,13 @@ async fn claim_or_split(
     } else {
         Some(etag.to_string())
     };
-    save_state(part_dir, url, &et_opt, total, &snapshot);
+    let sk = ctrl
+        .state_key
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    save_state_with_key(part_dir, url, &sk, &et_opt, total, &snapshot);
     Some(new_idx)
 }
 
@@ -1679,9 +2391,16 @@ async fn run_segment(
     // any segment completes still resumes (was: file written only on split).
     {
         let s = segs.lock().await;
-        save_state(
+        let sk = ctrl
+            .state_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
+        save_state_with_key(
             part_dir,
             &task.url,
+            &sk,
             &if etag.is_empty() {
                 None
             } else {
@@ -1716,6 +2435,12 @@ async fn run_segment(
             Some(etag.to_string())
         };
         let ck_ctrl = ctrl.clone();
+        let ck_sk = ctrl
+            .state_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
         let checkpoint = move |abs_done: u64| {
             if let Ok(mut s) = ck_segs.try_lock() {
                 let new_len = s[i].end + 1 - s[i].start;
@@ -1737,7 +2462,7 @@ async fn run_segment(
                         })
                         .collect();
                 }
-                save_state(&ck_part_dir, &ck_url, &ck_etag, total, &snap);
+                save_state_with_key(&ck_part_dir, &ck_url, &ck_sk, &ck_etag, total, &snap);
             }
         };
         // Permit BEFORE every GET incl. 429 retries: this is the actual
@@ -1799,9 +2524,16 @@ async fn run_segment(
                             })
                             .collect();
                         drop(pg);
-                        save_state(
+                        let sk = ctrl
+                            .state_key
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .unwrap_or_default();
+                        save_state_with_key(
                             part_dir,
                             &task.url,
+                            &sk,
                             &if etag.is_empty() {
                                 None
                             } else {
@@ -1859,7 +2591,13 @@ async fn run_segment(
                 } else {
                     Some(etag.to_string())
                 };
-                save_state(part_dir, &task.url, &et_opt, total, &snapshot);
+                let sk = ctrl
+                    .state_key
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_default();
+                save_state_with_key(part_dir, &task.url, &sk, &et_opt, total, &snapshot);
                 if keep < written {
                     continue;
                 }
@@ -1867,7 +2605,9 @@ async fn run_segment(
                 return Ok(());
             }
             Err(e) => {
-                if ctrl.cancelled.load(Ordering::Relaxed) {
+                if ctrl.cancelled.load(Ordering::Relaxed)
+                    || ctrl.ranges_ignored.load(Ordering::Relaxed)
+                {
                     return Err(e);
                 }
                 last_err = e.clone();
@@ -1876,6 +2616,18 @@ async fn run_segment(
                     return Err(format!(
                         "segment download failed after retries (last: {last_err})"
                     ));
+                }
+                // 403/404 mid-download with state_key set: ticket URL
+                // likely expired. Bail so the caller re-resolves a fresh
+                // ticket and re-enters; parts persist under state_key.
+                if ctrl
+                    .state_key
+                    .lock()
+                    .unwrap_or_else(|e2| e2.into_inner())
+                    .is_some()
+                    && (last_err.contains("403") || last_err.contains("404"))
+                {
+                    return Err("ticket-expired: re-resolve required".to_string());
                 }
                 drop(_permit);
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -1937,25 +2689,30 @@ async fn download_range(
     on_checkpoint: Option<&(dyn Fn(u64) + Send + Sync)>,
     gate: Option<&ConcurrencyGate>,
 ) -> Result<RangeOutcome, String> {
-    let resp = client
-        .get(&task.url)
-        .headers(headers_for(task))
-        .header("Range", format!("bytes={start}-{end}"))
-        .send()
+    let resp = send_with_cookie_redirects(client, task, &task.url, Some((start, Some(end))))
         .await
         .map_err(|e| e.to_string())?;
-    if resp.status().as_u16() == 429 {
-        let ra = retry_after_secs(resp.headers());
-        if let Some(g) = gate {
-            g.on_throttled();
+    match range_response_action(resp.status().as_u16(), prior > 0) {
+        RangeResponseAction::Throttled => {
+            let ra = retry_after_secs(resp.headers());
+            if let Some(g) = gate {
+                g.on_throttled();
+            }
+            return Ok(RangeOutcome::Throttled {
+                written: 0,
+                retry_after: ra,
+            });
         }
-        return Ok(RangeOutcome::Throttled {
-            written: 0,
-            retry_after: ra,
-        });
-    }
-    if resp.status().as_u16() != 206 {
-        return Err(format!("expected 206 got {}", resp.status()));
+        RangeResponseAction::RangesIgnored => {
+            // Probe claimed ranges but real Range gets 200: abandon
+            // segmented mode; wrapper restarts as single-stream.
+            ctrl.ranges_ignored.store(true, Ordering::Relaxed);
+            return Err("server ignored Range (200): downgrading to single-stream".into());
+        }
+        RangeResponseAction::Range => {}
+        RangeResponseAction::Error => {
+            return Err(format!("expected 206 got {}", resp.status()));
+        }
     }
     if let Some(g) = gate {
         g.mark_streaming();
@@ -2486,9 +3243,12 @@ async fn fetch_once_counted_impl(
     file: &mut tokio::fs::File,
     ctrl: &Controls,
 ) -> Result<u64, String> {
-    let req = client.get(url).headers(headers_for(task));
-    // byte-range segment stored in headers via special marker? HLS BYTERANGE passed through task headers Range by caller when needed.
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    // Full-segment fetch: no byte range. Captured `Range` rows are denied
+    // wire headers and must NEVER apply here — HLS byte-ranges travel only
+    // via the explicit `fetch_bytes_counted` argument.
+    let resp = send_with_cookie_redirects(client, task, url, None)
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {} for {url}", resp.status()));
     }
@@ -2550,17 +3310,21 @@ pub async fn fetch_bytes_counted(
     range: Option<(u64, Option<u64>)>,
     dest: &Path,
 ) -> Result<u64, String> {
-    let mut req = client.get(url).headers(headers_for(task));
-    if let Some((len, off)) = range {
-        let start = off.unwrap_or(0);
-        // len==0 (hostile/garbled HLS byterange) underflows start+len-1: debug panic, release wrap.
-        let end = start
-            .checked_add(len)
-            .and_then(|e| e.checked_sub(1))
-            .ok_or("invalid byte range length 0")?;
-        req = req.header("Range", format!("bytes={start}-{end}"));
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let range_span = match range {
+        Some((len, off)) => {
+            let start = off.unwrap_or(0);
+            // len==0 (hostile/garbled HLS byterange) underflows start+len-1: debug panic, release wrap.
+            let end = start
+                .checked_add(len)
+                .and_then(|e| e.checked_sub(1))
+                .ok_or("invalid byte range length 0")?;
+            Some((start, Some(end)))
+        }
+        None => None,
+    };
+    let resp = send_with_cookie_redirects(client, task, url, range_span)
+        .await
+        .map_err(|e| e.to_string())?;
     if !resp.status().is_success() && resp.status().as_u16() != 206 {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -2684,9 +3448,10 @@ fn ext_of_str(name: &str) -> String {
 
 /// Validate finished output. Strict checks (empty, playlist/HTML body,
 /// magic) ONLY for media-family dest (mp4,m4a,mov,mkv,webm,mp3,ts,m4s,
-/// opus,ogg,flac,wav,aac) by dest or context filename extension. Generic
-/// downloads always pass (Ok(len), missing file still errors) — legit
-/// 0-byte/.html/legacy-.mov/ADTS-.aac files must not false-reject.
+/// opus,ogg,flac,wav,aac) plus ZIP-family dest (zip/jar/apk etc: PK magic)
+/// by dest or context filename extension. Generic downloads always pass
+/// (Ok(len), missing file still errors) — legit 0-byte/.html/legacy-.mov/
+/// ADTS-.aac files must not false-reject.
 /// Pure: never renames. Returns file size.
 pub fn validate_output(dest: &Path, filename_for_error_context: &str) -> Result<u64, ValidateFail> {
     validate_output_impl(dest, filename_for_error_context, false)
@@ -2725,7 +3490,11 @@ fn validate_output_impl(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !force_media && !is_media_ext(&ctx_ext) && !is_media_ext(&dest_ext) {
+    const ZIP_EXTS: &[&str] = &[
+        "zip", "jar", "apk", "xpi", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp", "cbz",
+    ];
+    let zip_ctx = ZIP_EXTS.contains(&ctx_ext.as_str()) || ZIP_EXTS.contains(&dest_ext.as_str());
+    if !force_media && !is_media_ext(&ctx_ext) && !is_media_ext(&dest_ext) && !zip_ctx {
         return Ok(size);
     }
     if size == 0 {
@@ -2772,6 +3541,13 @@ fn validate_output_impl(
         return Err(ValidateFail::TsInMp4);
     }
     let ok = match ext.as_str() {
+        "zip" | "jar" | "apk" | "xpi" | "epub" | "docx" | "xlsx" | "pptx" | "odt" | "ods"
+        | "odp" | "cbz" => {
+            // Local file header, empty-archive end record, or spanned marker.
+            head.starts_with(b"PK\x03\x04")
+                || head.starts_with(b"PK\x05\x06")
+                || head.starts_with(b"PK\x07\x08")
+        }
         // mov legacy: permissive (no ftyp, e.g. legacy QuickTime). mp4/m4v:
         // ftyp OR styp start; styp files still subject to box walk below.
         // m4a excluded: ADTS-.m4a has no ftyp.
@@ -2987,12 +3763,228 @@ mod tests {
     }
 
     #[test]
+    fn headers_for_denies_stack_owned_rows() {
+        let t = task_with_headers(&[
+            ("host", "evil.example"),
+            ("content-length", "999"),
+            ("range", "bytes=0-99"),
+            ("accept-encoding", "gzip"),
+            ("content-encoding", "gzip"),
+            ("transfer-encoding", "chunked"),
+            ("expect", "100-continue"),
+            ("connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("te", "trailers"),
+            ("trailer", "x-t"),
+            ("upgrade", "h2c"),
+            ("proxy-authorization", "Basic x"),
+            ("set-cookie", "a=b"),
+            ("www-authenticate", "Basic"),
+            ("if-match", "\"x\""),
+            ("if-none-match", "\"x\""),
+            ("if-modified-since", "Wed, 01 Jan 2025 00:00:00 GMT"),
+            ("if-unmodified-since", "Wed, 01 Jan 2025 00:00:00 GMT"),
+            ("if-range", "\"x\""),
+            ("X-Good", "ok"),
+        ]);
+        let h = headers_for(&t);
+        for k in [
+            "host",
+            "content-length",
+            "range",
+            "accept-encoding",
+            "content-encoding",
+            "transfer-encoding",
+            "expect",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "upgrade",
+            "proxy-authorization",
+            "set-cookie",
+            "www-authenticate",
+            "if-match",
+            "if-none-match",
+            "if-modified-since",
+            "if-unmodified-since",
+            "if-range",
+        ] {
+            assert!(!h.contains_key(k), "denied header leaked: {k}");
+            assert!(is_denied_wire_header(k));
+        }
+        assert!(!is_denied_wire_header("user-agent"));
+        assert!(!is_denied_wire_header("authorization"));
+        assert!(!is_denied_wire_header("x-api-token"));
+        assert_eq!(h["x-good"], "ok");
+    }
+
+    #[test]
+    fn headers_for_target_origin_scoping() {
+        // Same origin: Authorization + Cookie (+ synthesized Basic) flow.
+        let mut t = task_with_headers(&[("Authorization", "Bearer tok"), ("X-Api-Key", "k1")]);
+        t.url = "https://cdn.example.com/f.zip".into();
+        t.cookies = "sid=1".into();
+        let own = headers_for_target(&t, "https://cdn.example.com/f.zip");
+        assert_eq!(own["authorization"], "Bearer tok");
+        assert_eq!(own["cookie"], "sid=1");
+        assert_eq!(own["x-api-key"], "k1");
+        // Explicit default port is still same origin.
+        let own443 = headers_for_target(&t, "https://cdn.example.com:443/f.zip");
+        assert_eq!(own443["authorization"], "Bearer tok");
+        // Cross-origin CDN: credentials stripped, other rows survive.
+        let cdn = headers_for_target(&t, "https://other.example.net/f.zip");
+        assert!(!cdn.contains_key("authorization"));
+        assert!(!cdn.contains_key("cookie"));
+        assert_eq!(cdn["x-api-key"], "k1");
+        // Downgrade https -> http: no credentials either.
+        let down = headers_for_target(&t, "http://cdn.example.com/f.zip");
+        assert!(!down.contains_key("authorization"));
+        assert!(!down.contains_key("cookie"));
+        // Synthesized Basic is origin-scoped too.
+        let mut b = task_with_headers(&[]);
+        b.url = "https://a.example/x".into();
+        b.username = "u".into();
+        b.password = "p".into();
+        assert!(headers_for_target(&b, "https://a.example/x").contains_key("authorization"));
+        assert!(
+            !headers_for_target(&b, "https://b.example/x").contains_key("authorization")
+        );
+        // auth_allowed is strict same-origin, no Drive exception.
+        assert!(auth_allowed_for_target(&t, "https://cdn.example.com/f.zip"));
+        assert!(!auth_allowed_for_target(&t, "https://takeout.example/f.zip"));
+    }
+
+    #[test]
+    fn headers_for_target_drive_cookie_exception() {
+        let mut t = task_with_headers(&[("Authorization", "Bearer tok")]);
+        t.url = "https://drive.google.com/file/d/x/view".into();
+        t.cookies = "SID=s".into();
+        // Drive chain: cookie crosses to usercontent over https,
+        // Authorization NEVER crosses, even to Google hosts.
+        let dl = headers_for_target(
+            &t,
+            "https://takeout-download-drive.usercontent.google.com/download/x.zip",
+        );
+        assert_eq!(dl["cookie"], "SID=s");
+        assert!(!dl.contains_key("authorization"));
+        // http (not https) gets nothing.
+        let plain = headers_for_target(&t, "http://usercontent.google.com/x");
+        assert!(!plain.contains_key("cookie"));
+        // Non-Google third party gets nothing.
+        let third = headers_for_target(&t, "https://tracker.example/x");
+        assert!(!third.contains_key("cookie"));
+        // cookie_allowed / merge scoping agree with the send rule.
+        assert!(cookie_allowed_for_target(
+            &t,
+            "https://takeout-download-drive.usercontent.google.com/download/x.zip"
+        ));
+        assert!(!cookie_allowed_for_target(&t, "https://tracker.example/x"));
+        assert!(set_cookie_merge_allowed(
+            &t,
+            "https://usercontent.google.com/download/x.zip"
+        ));
+        assert!(!set_cookie_merge_allowed(&t, "https://tracker.example/x"));
+    }
+
+    #[test]
     fn headers_for_cookies_field_beats_cookie_row() {
         let mut t = task_with_headers(&[("Cookie", "row=1"), ("User-Agent", "UA/2")]);
         t.cookies = "field=1".into();
         let h = headers_for(&t);
         assert_eq!(h["cookie"], "field=1");
         assert_eq!(h["user-agent"], "UA/2");
+    }
+
+    #[test]
+    fn headers_for_cookie_row_used_when_field_empty() {
+        let t = task_with_headers(&[("Cookie", "row=1"), ("User-Agent", "UA/2")]);
+        let h = headers_for(&t);
+        assert_eq!(h["cookie"], "row=1");
+        assert_eq!(h["user-agent"], "UA/2");
+    }
+
+    #[test]
+    fn headers_for_referer_row_used_when_field_empty() {
+        let t = task_with_headers(&[("Referer", "https://row.example/")]);
+        let h = headers_for(&t);
+        assert_eq!(h["referer"], "https://row.example/");
+    }
+
+    #[test]
+    fn redirect_and_cookie_decisions() {
+        // Non-redirect status: stay.
+        assert_eq!(
+            redirect_next_url(200, "https://ex.com/f", "https://ex.com/a", 0).unwrap(),
+            None
+        );
+        // Relative Location joins against current URL.
+        assert_eq!(
+            redirect_next_url(302, "/next?q=1", "https://ex.com/a/b", 0).unwrap(),
+            Some("https://ex.com/next?q=1".into())
+        );
+        // Absolute cross-host (Google chain shape) is followed.
+        assert_eq!(
+            redirect_next_url(
+                302,
+                "https://accounts.google.com/Continue?x=1",
+                "https://takeout-download-drive.usercontent.google.com/download/d.zip",
+                0
+            )
+            .unwrap(),
+            Some("https://accounts.google.com/Continue?x=1".into())
+        );
+        // Hop cap fails hard instead of looping forever.
+        assert!(redirect_next_url(302, "https://ex.com/b", "https://ex.com/a", REDIRECT_HOP_LIMIT).is_err());
+        // Non-HTTP scheme is refused.
+        assert!(redirect_next_url(302, "ftp://ex.com/f", "https://ex.com/a", 0).is_err());
+
+        // needs_cookie_redirect: Drive URLs and Cookie-row tasks.
+        let plain = task_with_headers(&[]);
+        assert!(needs_cookie_redirect(
+            "https://takeout-download-drive.usercontent.google.com/download/d.zip",
+            &plain
+        ));
+        assert!(!needs_cookie_redirect("https://example.com/f.zip", &plain));
+        let cookie_row = task_with_headers(&[("Cookie", "a=b")]);
+        assert!(needs_cookie_redirect("https://example.com/f.zip", &cookie_row));
+
+        // Sign-in page detection: Drive zip task ending on accounts HTML.
+        assert!(is_drive_signin_page(
+            "https://takeout-download-drive.usercontent.google.com/download/d-1.zip",
+            "https://accounts.google.com/confirmidentifier",
+            Some("text/html; charset=UTF-8")
+        ));
+        assert!(is_drive_signin_page(
+            "https://takeout-download-drive.usercontent.google.com/download/d-1.zip",
+            "https://takeout-download-drive.usercontent.google.com/download/d-1.zip",
+            Some("text/html")
+        ));
+        // Actual zip bytes from usercontent are not a sign-in page.
+        assert!(!is_drive_signin_page(
+            "https://takeout-download-drive.usercontent.google.com/download/d-1.zip",
+            "https://takeout-download-drive.usercontent.google.com/download/d-1.zip",
+            Some("application/zip")
+        ));
+        // Non-Drive tasks never hit the wall.
+        assert!(!is_drive_signin_page(
+            "https://example.com/f.zip",
+            "https://accounts.google.com/x",
+            Some("text/html")
+        ));
+
+        // Set-Cookie merge: replace same-name, keep others, append new.
+        assert_eq!(
+            merge_cookies_header("SID=a; NID=b", &["SID=c; Path=/; HttpOnly".into()]),
+            "SID=c; NID=b"
+        );
+        assert_eq!(
+            merge_cookies_header("SID=a", &["NEW=d; Path=/".into()]),
+            "SID=a; NEW=d"
+        );
+        assert_eq!(merge_cookies_header("", &[]), "");
     }
 
     #[test]
@@ -3166,6 +4158,51 @@ mod tests {
             "HTML err"
         );
     }
+    #[test]
+    fn drive_plain_and_range_helpers() {
+        assert_eq!(
+            probe_fallback_plan(Some(403)),
+            Some(ProbeFallbackPlan {
+                status: 403,
+                retry_plain: true
+            })
+        );
+        assert_eq!(probe_fallback_plan(Some(416)), None);
+        assert_eq!(probe_fallback_plan(None), None);
+        assert_eq!(check_plain_complete(5, Some(10)), Err("incomplete download: got 5 of 10 bytes".into()));
+        assert!(check_plain_complete(10, Some(10)).is_ok());
+        assert!(check_plain_complete(0, None).is_ok());
+        assert_eq!(
+            range_response_action(200, false),
+            RangeResponseAction::RangesIgnored
+        );
+        assert_eq!(
+            range_response_action(200, true),
+            RangeResponseAction::Error
+        );
+        assert_eq!(range_response_action(206, false), RangeResponseAction::Range);
+        assert_eq!(
+            range_response_action(429, false),
+            RangeResponseAction::Throttled
+        );
+        assert_eq!(range_response_action(403, false), RangeResponseAction::Error);
+    }
+
+    #[test]
+    fn validate_output_zip_magic() {
+        let p = tmp_file("z1", "a.zip", b"PK\x03\x04rest");
+        assert!(validate_output(&p, "a.zip").is_ok());
+        let p = tmp_file("z2", "empty.zip", b"PK\x05\x06rest");
+        assert!(validate_output(&p, "empty.zip").is_ok());
+        let p = tmp_file("z3", "html.zip", b"<html><body>sign in</body></html>");
+        assert_eq!(validate_output(&p, "html.zip"), Err(ValidateFail::Playlist));
+        let p = tmp_file("z4", "bad.zip", b"not-a-zip........");
+        assert!(matches!(
+            validate_output(&p, "bad.zip"),
+            Err(ValidateFail::Msg(_))
+        ));
+    }
+
     #[test]
     fn validate_output_generic_passes() {
         // 0-byte generic file passes.

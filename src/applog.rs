@@ -401,6 +401,8 @@ fn is_sensitive_key(k: &str) -> bool {
             | "private_key"
             | "authorization"
             | "auth"
+            | "cookie"
+            | "cookie2"
             | "key"
             | "sig"
             | "signature"

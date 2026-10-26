@@ -71,6 +71,9 @@ fn prewarm_eligible(task: &DownloadTask) -> bool {
         || ytdlp::is_video_page(u)
         || crate::torrent::is_torrent_url(u)
         || crate::stream::is_nzb_url_str(u)
+        // transfer.it: bare URL serves an HTML SPA shell; engine probe
+        // would misreport/parts-map it. Download resolves via API.
+        || downloadcraft_lib::transferit::is_task_url(u)
     {
         return false;
     }
@@ -293,6 +296,22 @@ struct PendingMegaAdd {
 
 type MegaAddSlot =
     std::sync::Arc<std::sync::Mutex<Option<Result<Vec<crate::mega::MegaFile>, String>>>>;
+
+/// Add-dialog transfer.it awaiting fan-out enumeration. Same fields as
+/// PendingMegaAdd; enumeration needs no debrid provider.
+#[derive(Clone)]
+struct PendingTransferAdd {
+    url: String,
+    referrer: String,
+    cookies: String,
+    queue_id: String,
+    start_now: bool,
+    proxy_url: String,
+}
+
+type TransferAddSlot = std::sync::Arc<
+    std::sync::Mutex<Option<Result<Vec<downloadcraft_lib::transferit::TransferFile>, String>>>,
+>;
 type DebridHostsSlot =
     std::sync::Arc<std::sync::Mutex<Option<(String, Vec<crate::debrid::HostStatus>)>>>;
 
@@ -439,13 +458,17 @@ fn yt_probe_eligible(url: &str) -> bool {
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return false;
     }
-    if crate::torrent::is_torrent_url(u) || crate::stream::is_nzb_url_str(u) {
+    if crate::torrent::is_torrent_url(u)
+        || crate::stream::is_nzb_url_str(u)
+        || downloadcraft_lib::transferit::is_task_url(u)
+    {
         return false;
     }
     let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     const MEDIA: &[&str] = &[
         ".mp4", ".mkv", ".webm", ".mov", ".avi", ".mpg", ".mpeg", ".mp3", ".wav", ".flac", ".ogg",
-        ".aac", ".m4a", ".wma",
+        ".aac", ".m4a", ".wma", ".zip", ".7z", ".rar", ".gz", ".bz2", ".xz", ".zst", ".tar",
+        ".tgz", ".iso", ".img", ".apk", ".exe", ".msi", ".dmg", ".deb", ".rpm", ".pdf",
     ];
     !MEDIA.iter().any(|e| path.ends_with(e))
 }
@@ -697,6 +720,12 @@ pub struct DownloadApp {
     /// listing -> normal single folder-URL task (fallback).
     mega_add_slot: MegaAddSlot,
     pending_mega_add: Option<PendingMegaAdd>,
+    /// transfer.it fan-out: confirm spawns list_transfer, drain creates
+    /// one task per file (per-file task URL, debrid_file_name set).
+    /// Failed/empty listing -> normal single task (download fails with
+    /// the same clear error).
+    transfer_add_slot: TransferAddSlot,
+    pending_transfer_add: Option<PendingTransferAdd>,
     /// Add-dialog per-download debrid override ("" = auto; see
     /// DownloadTask::debrid_choice). Reset on confirm/cancel.
     add_debrid_choice: String,
@@ -1062,6 +1091,8 @@ impl DownloadApp {
             pending_debrid_add: None,
             mega_add_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_mega_add: None,
+            transfer_add_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_transfer_add: None,
             add_nzb_url: String::new(),
             add_nzb: None,
             add_nzb_loading: false,
@@ -1395,6 +1426,96 @@ impl DownloadApp {
                         status: TaskStatus::Queued,
                         category: crate::model::category_for(&f.name).into(),
                         debrid_choice: pending.debrid_choice.clone(),
+                        debrid_file_name: f.name.clone(),
+                        total: f.size,
+                        referrer: pending.referrer.clone(),
+                        cookies: pending.cookies.clone(),
+                        proxy_url: pending.proxy_url.clone(),
+                        ..Default::default()
+                    };
+                    ids.push(task.id.clone());
+                    dl_history::append_event_default(
+                        &dl_history::DlEvent::new(&task.id, dl_history::KIND_ADDED)
+                            .with_filename(&task.filename)
+                            .with_url(&task.url)
+                            .with_bytes(task.downloaded, task.total.unwrap_or(0)),
+                    );
+                    g.state.tasks.push(task);
+                }
+                g.save();
+            }
+        }
+        if pending.start_now {
+            for id in &ids {
+                if !self.gate_collision(id, true) {
+                    self.start_task(id);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// transfer.it fan-out drain: one task per file, each with its
+    /// per-file task URL (`/t/<xh>/<handle>`) so download picks the node
+    /// by handle. Failure/empty = single normal task (download surfaces
+    /// the same clear error). Mirrors poll_mega_add.
+    fn poll_transfer_add(&mut self, ctx: &egui::Context) {
+        if self.pending_transfer_add.is_none() {
+            return;
+        }
+        let taken = self
+            .transfer_add_slot
+            .try_lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let Some(res) = taken else { return };
+        let pending = self.pending_transfer_add.take().unwrap();
+        let files = match res {
+            Ok(f) if !f.is_empty() => f,
+            _ => Vec::new(),
+        };
+        let xh =
+            downloadcraft_lib::transferit::parse_transfer_url(&pending.url).unwrap_or_default();
+        let mut ids: Vec<String> = Vec::new();
+        {
+            let mut g = crate::lock_unpoison(&self.rt);
+            if files.is_empty() {
+                let id = g.add_url(
+                    &pending.url,
+                    &pending.queue_id,
+                    &pending.referrer,
+                    &pending.cookies,
+                );
+                if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
+                    // transfer.it is direct-only (no debrid provider
+                    // supports it): force local regardless of picker.
+                    t.debrid_choice = "none".to_string();
+                    g.save();
+                }
+                ids.push(id);
+            } else {
+                for f in &files {
+                    let fname = crate::model::sanitize_filename(&f.name);
+                    let order = g.state.tasks.len() as i64 + 1;
+                    let task = DownloadTask {
+                        id: crate::model::new_id(),
+                        url: downloadcraft_lib::transferit::task_url(&xh, &f.handle),
+                        dest_dir: crate::model::dest_dir_for(
+                            &g.state.settings.download_dir,
+                            &fname,
+                            g.state.settings.category_subfolders,
+                        ),
+                        filename: fname,
+                        queue_id: if pending.queue_id.is_empty() {
+                            "main".into()
+                        } else {
+                            pending.queue_id.clone()
+                        },
+                        order,
+                        status: TaskStatus::Queued,
+                        category: crate::model::category_for(&f.name).into(),
+                        // Direct-only: never debrid for transfer.it.
+                        debrid_choice: "none".to_string(),
                         debrid_file_name: f.name.clone(),
                         total: f.size,
                         referrer: pending.referrer.clone(),
@@ -2399,25 +2520,44 @@ impl DownloadApp {
         {
             let pj = crate::platform::config_dir().join("pending-add.json");
             let pt = crate::platform::config_dir().join("pending-add.txt");
-            let mut pending_add: Option<(String, String, String, String)> = None;
+            struct PendingAdd {
+                url: String,
+                referrer: String,
+                cookies: String,
+                cookies_json: String,
+                headers: Vec<(String, String)>,
+            }
+            let mut pending_add: Option<PendingAdd> = None;
             if let Ok(s) = std::fs::read_to_string(&pj) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                    pending_add = v.get("url").and_then(|x| x.as_str()).map(|u| {
-                        (
-                            u.to_string(),
-                            v.get("referrer")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            v.get("cookies")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            v.get("cookiesJson")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        )
+                    pending_add = v.get("url").and_then(|x| x.as_str()).map(|u| PendingAdd {
+                        url: u.to_string(),
+                        referrer: v
+                            .get("referrer")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        cookies: v
+                            .get("cookies")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        cookies_json: v
+                            .get("cookiesJson")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        headers: v
+                            .get("headers")
+                            .and_then(|h| h.as_object())
+                            .map(|o| {
+                                o.iter()
+                                    .filter_map(|(k, val)| {
+                                        val.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect::<Vec<(String, String)>>()
+                            })
+                            .unwrap_or_default(),
                     });
                     if pending_add.is_some() {
                         let _ = std::fs::remove_file(&pj);
@@ -2429,17 +2569,26 @@ impl DownloadApp {
                     let u = s.trim().to_string();
                     if !u.is_empty() {
                         let _ = std::fs::remove_file(&pt);
-                        pending_add = Some((u, String::new(), String::new(), String::new()));
+                        pending_add = Some(PendingAdd {
+                            url: u,
+                            referrer: String::new(),
+                            cookies: String::new(),
+                            cookies_json: String::new(),
+                            headers: Vec::new(),
+                        });
                     }
                 }
             }
-            if let Some((u, referrer, cookies, cookies_json)) = pending_add {
+            if let Some(pa) = pending_add {
                 self.show_window_full(ctx);
                 self.tab = Tab::Downloads;
-                self.add_url = u;
-                self.add_referrer = referrer;
-                self.add_cookies = cookies;
-                self.add_cookies_json = cookies_json;
+                self.add_url = pa.url;
+                self.add_referrer = pa.referrer;
+                self.add_cookies = pa.cookies;
+                self.add_cookies_json = pa.cookies_json;
+                if !pa.headers.is_empty() {
+                    self.add_headers = pa.headers;
+                }
                 self.show_add = true;
                 self.add_just_opened = true;
                 self.add_raise_frames = 90;
@@ -3800,6 +3949,7 @@ impl eframe::App for DownloadApp {
         }
         self.poll_debrid_add(ctx);
         self.poll_mega_add(ctx);
+        self.poll_transfer_add(ctx);
         // Paint full viewport first: panel gaps otherwise show OS black (#09) as a vertical bar.
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             ctx.screen_rect(),
@@ -6498,13 +6648,56 @@ fn header_row_error(name: &str, value: &str) -> Option<String> {
     if name.is_empty() {
         return Some("Header name is empty.".into());
     }
+    if name.eq_ignore_ascii_case("cookie")
+        && value
+            .split(';')
+            .any(|seg| !seg.trim().is_empty() && !seg.contains('='))
+    {
+        return Some("Cookie value must be name=value pairs separated by ';'.".into());
+    }
     if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
         return Some(format!("Invalid header name: {name}"));
+    }
+    // Denied wire headers are stack-owned (Range, Host, accept-encoding,
+    // ...) or response/hop-by-hop names: the engine would drop the row
+    // silently, so reject it here where the user can see why.
+    if crate::engine::is_denied_wire_header(name) {
+        return Some(format!(
+            "Header {name} is set by webcraft itself and cannot be sent."
+        ));
     }
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Some(format!(
             "Invalid value for header {name} (CR/LF not allowed)."
         ));
+    }
+    None
+}
+
+/// Row-level validation over the whole header draft: case-insensitive
+/// duplicate names (engine winner is otherwise alphabetical-last) and
+/// over-long names/values. First error wins (never echoes a value).
+fn header_rows_error(rows: &[(String, String)]) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for (n, v) in rows {
+        let (n, v) = (n.trim(), v.trim());
+        if n.is_empty() && v.is_empty() {
+            continue;
+        }
+        if let Some(e) = header_row_error(n, v) {
+            return Some(e);
+        }
+        if n.len() > 64 {
+            return Some(format!("Header name too long: {n}"));
+        }
+        if v.len() > 4096 {
+            return Some(format!("Value for header {n} exceeds 4096 characters."));
+        }
+        let key = n.to_ascii_lowercase();
+        if seen.contains(&key) {
+            return Some(format!("Duplicate header: {n}"));
+        }
+        seen.push(key);
     }
     None
 }
@@ -7341,17 +7534,68 @@ impl DownloadApp {
             }
             // Debrid picker for debrid-eligible captures (browser magnet/
             // .torrent/hoster URL): edits task choice via write-back below.
+            // transfer.it is direct-only: no picker for it.
             {
-                let debrid_kind = crate::debrid::is_magnet(&t.url)
-                    || crate::torrent::is_torrent_task(&t)
-                    || t.url.trim().starts_with("http://")
-                    || t.url.trim().starts_with("https://");
+                let debrid_kind = !downloadcraft_lib::transferit::is_task_url(&t.url)
+                    && !crate::debrid::is_google_drive_url(&t.url)
+                    && (crate::debrid::is_magnet(&t.url)
+                        || crate::torrent::is_torrent_task(&t)
+                        || t.url.trim().starts_with("http://")
+                        || t.url.trim().starts_with("https://"));
                 if debrid_kind {
                     let s = crate::lock_unpoison(&app.rt).state.settings.clone();
                     ui.add_space(theme::SP_SM);
                     let magnet_kind =
                         crate::debrid::is_magnet(&t.url) || crate::torrent::is_torrent_task(&t);
                     ui_debrid_section(ui, &s, &mut t.debrid_choice, magnet_kind);
+                }
+            }
+            // Captured browser headers: read-only summary so credentials are
+            // never invisible. Authorization values are masked; wire
+            // filtering (denylist + origin scoping) happens at send time.
+            {
+                let wire: Vec<(&String, &String)> = t
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        !crate::ytdlp::YT_HEADER_KEYS
+                            .iter()
+                            .any(|x| k.eq_ignore_ascii_case(x))
+                            && !k.to_ascii_lowercase().starts_with("x-page-")
+                            && !matches!(
+                                k.to_ascii_lowercase().as_str(),
+                                "x-ytdlp" | "x-rep-id" | "x-variant-index" | "x-nzb"
+                            )
+                    })
+                    .collect();
+                if !wire.is_empty() || !t.cookies.is_empty() {
+                    ui.add_space(theme::SP_SM);
+                    egui::CollapsingHeader::new(format!(
+                        "Headers ({}{})",
+                        wire.len(),
+                        if t.cookies.is_empty() { "" } else { " + cookies" }
+                    ))
+                    .id_salt("cap-headers")
+                    .show(ui, |ui| {
+                        for (k, v) in &wire {
+                            let shown = if k.eq_ignore_ascii_case("authorization") {
+                                "••••".to_string()
+                            } else if v.chars().count() > 80 {
+                                format!("{}…", v.chars().take(80).collect::<String>())
+                            } else {
+                                v.to_string()
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{k}: {shown}"))
+                                        .color(theme::TEXT_MUTED)
+                                        .small(),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        }
+                    });
                 }
             }
             // Write back every edit (Browse/Category/Queue were dropped unless stream kind).
@@ -7503,6 +7747,10 @@ impl DownloadApp {
                 // recompute from filename and silently revert user pick.
                 // dest_dir already shown/editable in dialog (Browse wins);
                 // funnel set it before dialog, don't override user edit.
+                // Google Drive is direct-only: force no-debrid on capture.
+                if crate::debrid::is_google_drive_url(&t.url) {
+                    t.debrid_choice = "none".to_string();
+                }
                 t.status = if act == "start" {
                     TaskStatus::Queued
                 } else {
@@ -7902,10 +8150,7 @@ impl DownloadApp {
             }
             let body = |ui: &mut egui::Ui, app: &mut Self, start: &mut Option<bool>, cancel: &mut bool| {
                 // Invalid header row blocks Add like other dialog gates.
-                let hdr_error = app
-                    .add_headers
-                    .iter()
-                    .find_map(|(n, v)| header_row_error(n, v));
+                let hdr_error = header_rows_error(&app.add_headers);
                 let out = egui::ScrollArea::vertical()
                     .id_salt("add-main")
                     .auto_shrink([false, false])
@@ -7971,10 +8216,13 @@ impl DownloadApp {
                     // Debrid picker for debrid-eligible kinds (magnet,
                     // .torrent, http(s) hoster/file URL): edits draft choice
                     // stamped on the task. Shown only with a usable provider.
-                    let debrid_kind = crate::debrid::is_magnet(&app.add_url)
-                        || crate::torrent::is_torrent_url(&app.add_url)
-                        || app.add_url.trim().starts_with("http://")
-                        || app.add_url.trim().starts_with("https://");
+                    // transfer.it is direct-only: no picker for it.
+                    let debrid_kind = !downloadcraft_lib::transferit::is_task_url(&app.add_url)
+                        && !crate::debrid::is_google_drive_url(&app.add_url)
+                        && (crate::debrid::is_magnet(&app.add_url)
+                            || crate::torrent::is_torrent_url(&app.add_url)
+                            || app.add_url.trim().starts_with("http://")
+                            || app.add_url.trim().starts_with("https://"));
                     if debrid_kind {
                         let s = crate::lock_unpoison(&app.rt).state.settings.clone();
                         ui.add_space(theme::SP_SM);
@@ -8269,7 +8517,10 @@ impl DownloadApp {
                     self.add_proxy.trim().to_string(),
                 );
                 // Valid non-empty rows only; invalid blocked at dialog gate.
-                let dchoice = if self.add_debrid_choice.is_empty() {
+                // Google Drive is direct-only: never stamp a debrid choice.
+                let dchoice = if crate::debrid::is_google_drive_url(&self.add_url) {
+                    "none".to_string()
+                } else if self.add_debrid_choice.is_empty() {
                     "auto".to_string()
                 } else {
                     self.add_debrid_choice.clone()
@@ -8281,7 +8532,58 @@ impl DownloadApp {
                     .filter(|(n, v)| {
                         !(n.is_empty() && v.is_empty()) && header_row_error(n, v).is_none()
                     })
+                    // Lowercase keys so case variants can't coexist.
+                    .map(|(n, v)| (n.to_ascii_lowercase(), v))
                     .collect();
+                // transfer.it fan-out: enumerate async, poll_transfer_add
+                // creates one task per file (per-file task URL). Direct-
+                // only — debrid providers do not support transfer.it, so
+                // the picker choice is ignored for these tasks.
+                if downloadcraft_lib::transferit::is_transfer_url(&url)
+                    && self.pending_transfer_add.is_none()
+                {
+                    let (_settings, proxy) = {
+                        let g = crate::lock_unpoison(&self.rt);
+                        (
+                            g.state.settings.clone(),
+                            crate::model::effective_proxy(
+                                &proxy_override,
+                                &g.state.settings.proxy_url,
+                            )
+                            .to_string(),
+                        )
+                    };
+                    if let Ok(mut s) = self.transfer_add_slot.try_lock() {
+                        *s = None;
+                    }
+                    self.pending_transfer_add = Some(PendingTransferAdd {
+                        url: url.clone(),
+                        referrer: referrer.clone(),
+                        cookies: cookies.clone(),
+                        queue_id: queue.clone(),
+                        start_now,
+                        proxy_url: proxy_override.clone(),
+                    });
+                    let slot = self.transfer_add_slot.clone();
+                    let rt2 = self.tokio_rt.clone();
+                    let ctx2 = ctx.clone();
+                    let url_clone = url.clone();
+                    std::thread::spawn(move || {
+                        let client = engine::build_client(&proxy);
+                        let res = rt2
+                            .block_on(downloadcraft_lib::transferit::list_transfer(
+                                client, &url_clone,
+                            ))
+                            .map(|t| t.files);
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(res);
+                        }
+                        ctx2.request_repaint();
+                    });
+                    self.show_add = false;
+                    self.add_raise_frames = 0;
+                    return;
+                }
                 // MEGA folder fan-out: enumerate async, poll_mega_add
                 // creates one task per file (per-file link). No debrid
                 // provider needed for enumeration; each task re-resolves
@@ -8390,7 +8692,21 @@ impl DownloadApp {
                     if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
                         // add_url has no cookies_json param: browser
                         // pending-add prefill rides here (yt-dlp jar).
-                        t.cookies_json = self.add_cookies_json.clone();
+                        // On a dedup hit, only overwrite when the dialog
+                        // actually carries fresh material — empty fields
+                        // must not erase a captured session.
+                        if !self.add_cookies_json.trim().is_empty() {
+                            t.cookies_json = self.add_cookies_json.clone();
+                        }
+                        if !referrer.trim().is_empty() {
+                            t.referrer = referrer.clone();
+                        }
+                        if !cookies.trim().is_empty() {
+                            t.cookies = cookies.clone();
+                        }
+                        if !custom_headers.is_empty() {
+                            t.headers.extend(custom_headers.clone());
+                        }
                         t.segments = segs;
                         if self.prewarm_add.url == url.trim() {
                             t.accept_ranges = self.prewarm_add.accept_ranges;
@@ -8401,7 +8717,6 @@ impl DownloadApp {
                         t.mirrors = mirrors;
                         t.description = desc;
                         t.proxy_url = proxy_override;
-                        t.headers.extend(custom_headers.clone());
                         // Torrent picker: empty vec = all files; validate vs probe.
                         // Only for torrent tasks; stale picker state must not leak.
                         if crate::torrent::is_torrent_task(t) && !self.add_torrent_files.is_empty()
@@ -13558,6 +13873,10 @@ mod progress_tests {
         assert!(!prewarm_eligible(&t("https://example.com/manifest.mpd")));
         assert!(!prewarm_eligible(&t("https://example.com/file.torrent")));
         assert!(!prewarm_eligible(&t("ftp://example.com/file.zip")));
+        assert!(!prewarm_eligible(&t("https://transfer.it/t/QqkN235n1J6K")));
+        assert!(!prewarm_eligible(&t(
+            "https://transfer.it/t/QqkN235n1J6K/WvpXVJaA"
+        )));
         assert!(!prewarm_eligible(&t("magnet:?xt=urn:btih:abc")));
         assert!(!prewarm_eligible(&t("not a url")));
         let mut yt = t("https://example.com/file.zip");
@@ -13571,8 +13890,12 @@ mod progress_tests {
         assert!(yt_probe_eligible("https://example.com/list.m3u8?tok=1"));
         assert!(yt_probe_eligible("https://example.com/manifest.mpd"));
         assert!(!yt_probe_eligible("https://example.com/movie.mp4?tok=1"));
+        assert!(!yt_probe_eligible(
+            "https://takeout-download-drive.usercontent.google.com/download/drive-download-20261026T143258Z-1-001.zip?j=x&i=0&user=1&authuser=0"
+        ));
         assert!(!yt_probe_eligible("https://example.com/song.MP3#frag"));
         assert!(!yt_probe_eligible("https://example.com/file.torrent"));
+        assert!(!yt_probe_eligible("https://transfer.it/t/QqkN235n1J6K"));
         assert!(!yt_probe_eligible("https://example.com/file.nzb?x=1"));
         assert!(!yt_probe_eligible("magnet:?xt=urn:btih:abc"));
         assert!(!yt_probe_eligible("ftp://example.com/page"));
@@ -13746,6 +14069,41 @@ mod player_fmt_tests {
         assert_eq!(fmt_hms(65.0), "0:01:05");
         assert_eq!(fmt_hms(3661.0), "1:01:01");
         assert_eq!(fmt_hms(-5.0), "0:00:00");
+    }
+}
+
+#[cfg(test)]
+mod header_row_tests {
+    use super::{header_row_error, header_rows_error};
+
+    #[test]
+    fn denied_and_duplicate_and_length_rows() {
+        // Denied wire headers are rejected where the user can see why.
+        for name in ["Range", "host", "Accept-Encoding", "If-None-Match"] {
+            let e = header_rows_error(&[(name.into(), "x".into())]).unwrap();
+            assert!(e.contains(name), "{e}");
+        }
+        // Ordinary browser rows pass.
+        assert!(header_rows_error(&[
+            ("User-Agent".into(), "BrowserUA/1".into()),
+            ("Authorization".into(), "Bearer tok".into()),
+            ("X-Api-Key".into(), "k".into()),
+        ])
+        .is_none());
+        // Case-insensitive duplicates rejected.
+        assert!(header_rows_error(&[
+            ("Accept".into(), "a".into()),
+            ("accept".into(), "b".into()),
+        ])
+        .is_some());
+        // Over-long name / value rejected.
+        assert!(header_rows_error(&[("x".repeat(65), "v".into())]).is_some());
+        assert!(header_rows_error(&[("X-A".into(), "v".repeat(4097))]).is_some());
+        // Empty draft rows ignored.
+        assert!(header_rows_error(&[(String::new(), String::new())]).is_none());
+        // Cookie rows must be name=value pairs (unchanged rule).
+        assert!(header_row_error("Cookie", "not-a-pair").is_some());
+        assert!(header_row_error("Cookie", "a=b; c=d").is_none());
     }
 }
 

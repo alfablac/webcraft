@@ -131,7 +131,7 @@ fn b64_val(c: u8) -> Option<u32> {
 }
 
 /// Base64 decode (URL-safe or standard), tolerating missing padding and commas.
-fn b64d(s: &str) -> Option<Vec<u8>> {
+pub fn b64d(s: &str) -> Option<Vec<u8>> {
     let cleaned: Vec<u8> = s
         .bytes()
         .filter(|b| !b.is_ascii_whitespace() && *b != b',')
@@ -209,6 +209,19 @@ fn dec_key(enc: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Unwrap a share-style node key: the 32-byte encrypted blob decrypted
+/// under a 16- or 32-byte wrapping key (AES-CBC per-16-byte-block, IV=0,
+/// the same scheme MEGA uses for folder/share node keys). Returns the
+/// 32-byte composite key when the blob is exactly 32 bytes.
+pub fn unwrap_node_key(enc: &[u8], wrapping_key: &[u8]) -> Option<Vec<u8>> {
+    let out = dec_key(enc, wrapping_key)?;
+    if out.len() == 32 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Fold a 32-byte key to 16 bytes by XORing the two halves bytewise.
 fn fold32(k: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -219,7 +232,7 @@ fn fold32(k: &[u8]) -> [u8; 16] {
 }
 
 /// Decrypt a node's encrypted attributes and return its `n` (name) field.
-fn decrypt_attrs(enc: &str, key: &[u8]) -> Option<String> {
+pub fn decrypt_attrs(enc: &str, key: &[u8]) -> Option<String> {
     if key.len() != 16 {
         return None;
     }
@@ -341,6 +354,35 @@ fn decrypt_nodes(folder_id: &str, key_bytes: &[u8], nodes: &serde_json::Value) -
     }
 }
 
+/// Decrypt a file node's attributes with its plain composite key
+/// (transfer.it stores keys unwrapped): the AES key is the XOR fold of
+/// the 32-byte key — same fold `decrypt_nodes` applies to folder files.
+pub fn decrypt_file_attrs(enc: &str, composite_key: &[u8]) -> Option<String> {
+    if composite_key.len() != 32 {
+        return None;
+    }
+    decrypt_attrs(enc, &fold32(composite_key))
+}
+
+/// Base64url-encode bytes without padding (MEGA's key encoding).
+pub fn b64e_nopad(data: &[u8]) -> String {
+    const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPH[(n >> 18) as usize & 63] as char);
+        out.push(ALPH[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPH[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPH[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
 pub async fn list_folder(http: reqwest::Client, url: &str) -> Result<MegaFolder, String> {
     let parsed = parse_url(url).ok_or_else(|| "not a MEGA folder URL".to_string())?;
     let key_bytes = b64d(&parsed.key).ok_or_else(|| "invalid MEGA folder key".to_string())?;
@@ -409,7 +451,8 @@ pub fn decrypt_file_in_place(path: &std::path::Path, key: &[u8]) -> Result<(), S
         f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         pos += n as u64;
     }
-    Ok(())
+    // Whole file decrypted: the chunk MACs must condense to key[24..32].
+    cipher.verify()
 }
 
 /// Direct download URL for a folder child node, for the no-debrid path.
@@ -455,6 +498,30 @@ pub struct FileCipher {
     nonce_hi: [u8; 8],
     ctr: u64,
     leftover: Vec<u8>,
+    /// `key[24..32]`: condensed chunk-MAC expected value (meta-MAC).
+    meta_mac: [u8; 8],
+    /// Running CBC-MAC state within the current chunk. Starts at
+    /// `nonce || nonce` for every chunk (SDK `SymmCipher::ctr_crypt`).
+    mac_state: [u8; 16],
+    /// macsmac accumulator: starts as 16 zero bytes; each finished
+    /// chunk MAC is XORed in and the result ECB-encrypted (SDK
+    /// `chunkmac_map::macsmac`).
+    mac_condensed: [u8; 16],
+    /// Buffered plaintext not yet MACed (trailing partial block).
+    mac_pending: Vec<u8>,
+    /// Index / in-chunk position of the MAC stream.
+    mac_chunk_index: u64,
+    mac_in_chunk: usize,
+    /// Plaintext bytes fed so far.
+    fed: u64,
+}
+
+/// MEGA data-chunk size for a 0-based chunk index: 128 KiB growing by
+/// 128 KiB per chunk up to 1 MiB, then constant 1 MiB. MACs are computed
+/// per chunk and condensed into the meta-MAC.
+fn chunk_size(index: u64) -> u64 {
+    const KIB: u64 = 1024;
+    (128 * KIB * (index + 1)).min(1024 * KIB)
 }
 
 impl FileCipher {
@@ -464,12 +531,127 @@ impl FileCipher {
         }
         let mut nonce_hi = [0u8; 8];
         nonce_hi.copy_from_slice(&composite_key[16..24]);
+        let mut meta_mac = [0u8; 8];
+        meta_mac.copy_from_slice(&composite_key[24..32]);
+        let mut mac_iv = [0u8; 16];
+        mac_iv[..8].copy_from_slice(&nonce_hi);
+        mac_iv[8..].copy_from_slice(&nonce_hi);
         Ok(Self {
             key: fold32(composite_key),
             nonce_hi,
             ctr: 0,
             leftover: Vec::new(),
+            meta_mac,
+            mac_state: mac_iv,
+            mac_condensed: [0u8; 16],
+            mac_pending: Vec::new(),
+            mac_chunk_index: 0,
+            mac_in_chunk: 0,
+            fed: 0,
         })
+    }
+
+    /// Feed decrypted plaintext into the per-chunk CBC-MAC. Chunks
+    /// follow [`chunk_size`]; only full 16-byte blocks inside the
+    /// current chunk are MACed immediately — a trailing partial block
+    /// might yet grow with the next feed, so it is buffered and
+    /// zero-padded only when the chunk completes (or at `verify`).
+    fn feed_mac(&mut self, plain: &[u8]) {
+        self.mac_pending.extend_from_slice(plain);
+        loop {
+            let csize = chunk_size(self.mac_chunk_index) as usize;
+            let in_chunk = csize - self.mac_in_chunk;
+            if self.mac_pending.is_empty() {
+                break;
+            }
+            let avail = self.mac_pending.len().min(in_chunk);
+            let chunk_end = avail == in_chunk;
+            // Only whole blocks may leave the buffer mid-chunk; a
+            // trailing partial block stays buffered — it might yet grow
+            // with the next feed. It is zero-padded (SDK `ctr_crypt`
+            // semantics) only when the chunk actually completes.
+            let take = if chunk_end { avail } else { avail / 16 * 16 };
+            if take == 0 {
+                break;
+            }
+            let buf: Vec<u8> = self.mac_pending.drain(..take).collect();
+            self.mac_chunk(&buf, chunk_end);
+            self.mac_in_chunk += take;
+            if self.mac_in_chunk == csize {
+                self.condense_chunk();
+            }
+        }
+        self.fed += plain.len() as u64;
+    }
+
+    /// CBC-MAC `data` (already bounded to the current chunk) under the
+    /// folded key starting from `mac_state`; a trailing partial block
+    /// is zero-padded only when `chunk_end` is true.
+    fn mac_chunk(&mut self, data: &[u8], chunk_end: bool) {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+        let mut off = 0usize;
+        while off + 16 <= data.len() {
+            for i in 0..16 {
+                self.mac_state[i] ^= data[off + i];
+            }
+            Aes128CbcEnc::new((&self.key).into(), (&[0u8; 16]).into())
+                .encrypt_block_mut((&mut self.mac_state).into());
+            off += 16;
+        }
+        if chunk_end && off < data.len() {
+            let mut padded = [0u8; 16];
+            padded[..data.len() - off].copy_from_slice(&data[off..]);
+            for (i, b) in padded.iter().enumerate() {
+                self.mac_state[i] ^= *b;
+            }
+            Aes128CbcEnc::new((&self.key).into(), (&[0u8; 16]).into())
+                .encrypt_block_mut((&mut self.mac_state).into());
+        }
+    }
+
+    /// Fold the finished chunk's MAC into the macsmac accumulator
+    /// (XOR in, then ECB-encrypt) and reset the per-chunk MAC state to
+    /// `nonce || nonce` for the next chunk (SDK `chunkmac_map`).
+    fn condense_chunk(&mut self) {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+        for i in 0..16 {
+            self.mac_condensed[i] ^= self.mac_state[i];
+        }
+        Aes128CbcEnc::new((&self.key).into(), (&[0u8; 16]).into())
+            .encrypt_block_mut((&mut self.mac_condensed).into());
+        self.mac_chunk_index += 1;
+        self.mac_in_chunk = 0;
+        self.mac_state = [0u8; 16];
+        self.mac_state[..8].copy_from_slice(&self.nonce_hi);
+        self.mac_state[8..].copy_from_slice(&self.nonce_hi);
+    }
+
+    /// Verify whole-file integrity: the macsmac of all chunk MACs,
+    /// folded to 8 bytes, must equal meta-MAC `key[24..32]`. Call
+    /// after all bytes were decrypted. Empty files have no chunks and
+    /// nothing to verify.
+    pub fn verify(&mut self) -> Result<(), String> {
+        if self.fed == 0 {
+            return Ok(());
+        }
+        // Flush the final (possibly partial) chunk.
+        if self.mac_in_chunk > 0 || !self.mac_pending.is_empty() {
+            let buf = std::mem::take(&mut self.mac_pending);
+            self.mac_chunk(&buf, true);
+            self.condense_chunk();
+        }
+        let mut folded = [0u8; 8];
+        for i in 0..4 {
+            folded[i] = self.mac_condensed[i] ^ self.mac_condensed[i + 4];
+            folded[i + 4] = self.mac_condensed[i + 8] ^ self.mac_condensed[i + 12];
+        }
+        if folded == self.meta_mac {
+            Ok(())
+        } else {
+            Err("MEGA integrity check failed (chunk MAC mismatch)".into())
+        }
     }
 
     /// Decrypt `data` at the current stream position. MEGA CTR uses the
@@ -479,7 +661,7 @@ impl FileCipher {
     /// in whole 16-byte blocks, chunks are expected block-aligned except
     /// the final one.
     pub fn decrypt_chunk(&mut self, data: &mut [u8]) {
-        use cbc::cipher::{KeyIvInit, StreamCipher};
+        use aes::cipher::StreamCipher;
         let mut off = 0usize;
         if !self.leftover.is_empty() {
             let n = self.leftover.len().min(data.len());
@@ -515,13 +697,18 @@ impl FileCipher {
             self.leftover = block[tail.len()..].to_vec();
             self.ctr = self.ctr.wrapping_add(1);
         }
+        // `data` is plaintext now: feed the chunk-MAC stream.
+        self.feed_mac(data);
     }
 }
 
-/// Decrypt a complete MEGA file body (test/small-file helper).
+/// Decrypt a complete MEGA file body (test/small-file helper). The
+/// chunk MACs are verified against the key's meta-MAC (skipped for
+/// zero-length files), so corruption fails instead of passing silently.
 pub fn decrypt_file(composite_key: &[u8], data: &mut [u8]) -> Result<(), String> {
-    FileCipher::new(composite_key)?.decrypt_chunk(data);
-    Ok(())
+    let mut cipher = FileCipher::new(composite_key)?;
+    cipher.decrypt_chunk(data);
+    cipher.verify()
 }
 
 #[cfg(test)]
@@ -685,6 +872,19 @@ mod tests {
     }
 
     #[test]
+    fn transfer_plain_key_helpers() {
+        // transfer.it fixture (public share material): node key is the
+        // plain 32-byte composite key — attrs fold32-decrypt, share URL
+        // re-encodes identically.
+        let a = "nPf9vTIxvG_BxIidKRSBwgEhtCafbDENrLntolCWQ-Bn1zC69xe4HLKehbgVtYBi8lH4nvFWYYuoHCy7oI0VrA";
+        let k = b64d("TPEpgreX18iRLIZWiOVHVDGhY3bVtz2tlGn6Bhnz03w").unwrap();
+        assert_eq!(k.len(), 32);
+        assert_eq!(decrypt_file_attrs(a, &k).as_deref(), Some("thunderbirds.iso"));
+        assert_eq!(b64e_nopad(&k), "TPEpgreX18iRLIZWiOVHVDGhY3bVtz2tlGn6Bhnz03w");
+        assert_eq!(decrypt_file_attrs(a, &k[..16]), None);
+    }
+
+    #[test]
     fn file_cipher_roundtrip() {
         // Encrypt with the same construction (CTR is symmetric), split
         // into unaligned chunks, decrypt with FileCipher: must round-trip.
@@ -702,9 +902,74 @@ mod tests {
             out.extend_from_slice(&c);
         }
         assert_eq!(out, plain);
-        // decrypt_file one-shot helper agrees.
-        let mut one = enc.clone();
-        decrypt_file(&key, &mut one).unwrap();
-        assert_eq!(one, plain);
+    }
+
+    /// Chunk-MAC verification against independently computed vectors.
+    /// The meta-MACs below were computed in Python (pycryptodome) from
+    /// the SDK scheme — per-chunk CBC-MAC starting from `nonce||nonce`
+    /// under the folded key, macsmac = ECB-encrypted XOR chain starting
+    /// from zero, folded 16→8 — NOT from this Rust code, so a wrong
+    /// construction here fails these tests.
+    fn check_mac_vector(key: &[u8; 32], plain: &[u8], tamper: bool) -> Result<(), String> {
+        // CTR-encrypt with a fresh cipher (symmetric), then decrypt in
+        // odd-sized feeds through another and verify its MAC.
+        let mut enc = FileCipher::new(key)?;
+        let mut ct = plain.to_vec();
+        enc.decrypt_chunk(&mut ct);
+        assert_ne!(ct[..plain.len().min(64)], plain[..plain.len().min(64)]);
+        if tamper {
+            let mid = ct.len() / 2;
+            ct[mid] ^= 0xFF;
+        }
+        let mut dec = FileCipher::new(key)?;
+        let mut out = Vec::new();
+        for chunk in ct.chunks(4097) {
+            let mut c = chunk.to_vec();
+            dec.decrypt_chunk(&mut c);
+            out.extend_from_slice(&c);
+        }
+        if !tamper {
+            assert_eq!(out, plain);
+        }
+        dec.verify()
+    }
+
+    #[test]
+    fn chunk_mac_verification() {
+        // Vector A: spans 3 chunks (128 KiB + 256 KiB growth, partial tail).
+        let key_a: [u8; 32] = [
+            0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0xb0, 0xb3, 0x71, 0x13, 0x27, 0x89, 0x85,
+            0xd9, 0x72, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1b, 0xd8, 0xb9, 0x8c,
+            0x25, 0x28, 0x77, 0xdd,
+        ];
+        let plain_a: Vec<u8> = (0..(128 * 1024 + 100_000 + 37))
+            .map(|i| ((i * 7 + 3) % 256) as u8)
+            .collect();
+        check_mac_vector(&key_a, &plain_a, false).unwrap();
+        assert!(check_mac_vector(&key_a, &plain_a, true).is_err());
+
+        // Vector B: single partial-block-heavy chunk (1000 bytes).
+        let key_b: [u8; 32] = [
+            0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0xb1, 0x95, 0x8c, 0x20, 0x11, 0xf7,
+            0xd3, 0xb6, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0xf9, 0xdc, 0xc6, 0x6b,
+            0x5d, 0xba, 0x9d, 0xf9,
+        ];
+        let plain_b: Vec<u8> = (0..1000).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        check_mac_vector(&key_b, &plain_b, false).unwrap();
+        assert!(check_mac_vector(&key_b, &plain_b, true).is_err());
+
+        // Vector C: exactly one full 128 KiB chunk (boundary: condensed
+        // eagerly inside feed_mac, verify must not re-flush).
+        let key_c: [u8; 32] = [
+            0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0xee, 0x4e, 0x0e, 0xb1, 0xde, 0xe2,
+            0x11, 0xd2, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0xc6, 0x67, 0x24, 0x9a,
+            0xf2, 0xcf, 0x3f, 0xfd,
+        ];
+        let plain_c: Vec<u8> = (0..128 * 1024).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        check_mac_vector(&key_c, &plain_c, false).unwrap();
+
+        // Zero-length file: nothing to verify.
+        let mut c = FileCipher::new(&key_c).unwrap();
+        c.verify().unwrap();
     }
 }
