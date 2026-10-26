@@ -1,6 +1,6 @@
 [package]
 name = "webcraft"
-version = "0.25.0"
+version = "0.25.1"
 edition = "2021"
 description = "Clean-room cross-platform download manager (IDM feature clone)"
 license = "MIT"

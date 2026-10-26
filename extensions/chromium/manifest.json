@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "webcraft Integration Module",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "description": "Send downloads to webcraft desktop app",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2Xn0fVZIXxQ0uggRmub9YfjzEgBAgJK6ASsJ048Z07krUJsAz/5y6P4K1eOQa3kPNJLwdDRENpfPqxCHKDJSO6J73rz8wQXmjnIHJXnxuVO7vaQZAmNPfCN3+u9bYPGNTM/kTAASZ6Y+olOZK3x8gsaFNbYPDi/MW3JdAtowAMEYH5jeHfYq4AnwUsq6h0z3aEyN/g5eBfPwxiH6rRZlAn7BfGf9wVxsFURkbdKcu3FjU5EJwy+zolAGOK9Wa79pk9foMF2oei8ydEC5Ge3pyZSXI1Cz99j99okOK5wE1CTgAOy3+g7zMQAqGQdvwloaoJrxrXkF2w7ajW42DcQC1wIDAQAB",
   "background": { "service_worker": "background.js" },
