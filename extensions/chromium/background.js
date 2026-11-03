@@ -105,10 +105,10 @@ function persistUrlHeaders() {
     let n = 0;
     for (const [u, e] of urlHeaders) {
       if (n >= 200) break;
-      // Authorization is never persisted: one-shot tokens must not
-      // outlive the worker in storage.
-      const h = {};
-      for (const [k, v] of Object.entries(e.headers)) if (k !== "authorization") h[k] = v;
+      // Authorization kept: storage.session is extension-private (cleared
+      // on browser exit), and stripping it lost gated-download headers
+      // across MV3 worker restarts. In-memory and persisted stay identical.
+      const h = { ...(e && e.headers ? e.headers : {}) };
       if (Object.keys(h).length) { o[u] = { headers: h, time: e.time }; n++; }
     }
     chrome.storage.session.set({ wcUrlHeaders: o });
@@ -120,6 +120,9 @@ async function loadUrlHeaders() {
     if (s && s.wcUrlHeaders) for (const [u, e] of Object.entries(s.wcUrlHeaders)) if (e && e.headers) urlHeaders.set(u, e);
   } catch (e) {}
 }
+// sendDownload awaits this before reading urlHeaders: a send racing worker
+// startup must not miss the persisted capture.
+let urlHeadersReady = Promise.resolve();
 function captureReqHeaders(details) {
   try {
     if (!details || !details.url || !Array.isArray(details.requestHeaders)) return;
@@ -251,7 +254,7 @@ if (chrome.webRequest) {
     const kill = (d) => { try { requestRecords.delete(d.requestId); } catch (e) {} };
     if (chrome.webRequest.onBeforeRequest) chrome.webRequest.onBeforeRequest.addListener(recordRequest, F);
     if (chrome.webRequest.onBeforeSendHeaders) chrome.webRequest.onBeforeSendHeaders.addListener(recordRequest, F, ["requestHeaders", "extraHeaders"]);
-    loadUrlHeaders();
+    urlHeadersReady = loadUrlHeaders();
     if (chrome.webRequest.onCompleted) chrome.webRequest.onCompleted.addListener(kill, F);
     if (chrome.webRequest.onErrorOccurred) chrome.webRequest.onErrorOccurred.addListener(kill, F);
   } catch (e) {}
@@ -337,6 +340,39 @@ if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
 function basename(name) {
   return name ? String(name).split(/[\\/]/).pop() || "" : "";
 }
+// Chrome tabs have no cookieStoreId (Firefox-only property). Incognito
+// cookies live in a separate store: resolve it via getAllCookieStores
+// (the store whose tabIds include this tab). Ordinary tabs return
+// undefined so no storeId is passed and the default behavior is unchanged.
+async function cookieStoreIdForTab(tab) {
+  try {
+    if (!tab || tab.id == null || !tab.incognito) return undefined;
+    if (!chrome.cookies || typeof chrome.cookies.getAllCookieStores !== "function") return undefined;
+    const stores = await chrome.cookies.getAllCookieStores();
+    const hit = (stores || []).find((s) => s && Array.isArray(s.tabIds) && s.tabIds.includes(tab.id));
+    return hit ? hit.id : undefined;
+  } catch (e) { return undefined; }
+}
+function tabIdForUrl(url) {
+  // DownloadItem exposes no tabId, so captured downloads recover their
+  // originating tab by URL from the webRequest-era Maps; most recent wins.
+  // hops/redirectFrom match redirect chains (item URL is the final URL).
+  if (!url) return null;
+  let best = null;
+  const scan = (r) => {
+    if (!r || !(r.tabId >= 0)) return;
+    const hit = r.url === url || r.redirectFrom === url || (Array.isArray(r.hops) && r.hops.includes(url));
+    if (hit && (!best || (r.time || 0) >= (best.time || 0))) best = r;
+  };
+  for (const r of requestRecords.values()) scan(r);
+  for (const c of candidates.values()) scan(c);
+  return best ? best.tabId : null;
+}
+async function tabForUrl(url) {
+  const tabId = tabIdForUrl(url);
+  if (tabId == null) return null;
+  try { return await chrome.tabs.get(tabId); } catch (e) { return null; }
+}
 async function sendDownload(url, tab, extra = {}) {
   let cookies = "";
   let cookiesJson = "";
@@ -344,10 +380,11 @@ async function sendDownload(url, tab, extra = {}) {
     // Cookies match page host (X/YouTube/Reddit session), not CDN host.
     // Page intent: pageUrl promotes to yt-dlp target app-side. Stream intent:
     // cookieUrl scopes cookies only, no promotion field sent.
-    // storeId from the tab so Firefox-container / Chrome-incognito
-    // sessions resolve their own cookie store, not the default one.
+    // storeId from the tab so incognito sessions resolve their own
+    // cookie store, not the default one (Chrome tabs lack cookieStoreId).
     const cookieQuery = { url: extra.pageUrl || extra.cookieUrl || url };
-    if (tab && tab.cookieStoreId) cookieQuery.storeId = tab.cookieStoreId;
+    const storeId = await cookieStoreIdForTab(tab);
+    if (storeId) cookieQuery.storeId = storeId;
     const cs = await chrome.cookies.getAll(cookieQuery);
     cookies = cs.map(c => `${c.name}=${c.value}`).join("; ");
     // Structured form for yt-dlp cookie jar (httpOnly/domain/expiry lost in string form).
@@ -360,7 +397,13 @@ async function sendDownload(url, tab, extra = {}) {
   // UA + Accept-Language synthesis so the engine never has to fall back
   // to the webcraft UA on never-requested URLs.
   try {
-    const got = urlHeaders.get(url) || urlHeaders.get(headerKeyIndex(url));
+    await urlHeadersReady.catch(() => {});
+    // Fallback: the tab's current URL (exact or origin+path index).
+    // content.js sends canonicalized page URLs (shorts->watch, /photo/N
+    // stripped, tracking params dropped), so the stored navigation
+    // headers may exist only under the real, uncleaned tab URL.
+    let got = urlHeaders.get(url) || urlHeaders.get(headerKeyIndex(url));
+    if (!got && tab && tab.url) got = urlHeaders.get(tab.url) || urlHeaders.get(headerKeyIndex(tab.url));
     const headers = { ...(got && got.headers ? got.headers : {}) };
     if (!headers["user-agent"] && typeof navigator !== "undefined" && navigator.userAgent) headers["user-agent"] = navigator.userAgent;
     if (!headers["accept-language"] && typeof navigator !== "undefined" && Array.isArray(navigator.languages) && navigator.languages.length) headers["accept-language"] = navigator.languages.join(",");
@@ -468,7 +511,7 @@ chrome.downloads.onCreated.addListener((item) => {
     try {
       if (!(await captureCheck(entry))) { resumeBrowser(entry.url, entry.filename); return; } // invalid/host-down: restart in browser
       bypass.set(entry.url, Date.now()); // BEFORE send: re-entrant onCreated hits bypass
-      const resp = await sendDownload(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
+      const resp = await sendDownload(entry.url, await tabForUrl(entry.url), { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
       if (!resp || resp.skipped || resp.type === "error") resumeBrowser(entry.url, entry.filename); // skipped/error: item already cancelled, re-download
     } catch (e) { resumeBrowser(entry.url, entry.filename); } // host died mid-send: file must not vanish
     pollResumeOnce().catch(() => {}); // poll on onCreated too (guarded skip-when-busy inside)
@@ -613,5 +656,7 @@ if (chrome.tabs && chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tab
   if (n) persistCandidates();
 });
 if (chrome.tabs && chrome.tabs.onRemoved) chrome.tabs.onRemoved.addListener((tabId) => { for (const [k, r] of [...requestRecords]) if (r.tabId === tabId) requestRecords.delete(k); for (const [u, c] of [...candidates]) if (c.tabId === tabId) candidates.delete(u); persistCandidates(); });
-// ponytail: urlHeaders intentionally not persisted/tab-cleaned — 10-min TTL
-// bounds it; SW restart only loses headers, UA fallback covers the gap.
+// urlHeaders persist to storage.session (wcUrlHeaders, incl.
+// Authorization — session storage is extension-private) and are reloaded
+// on SW start via urlHeadersReady, which sendDownload awaits; entries are
+// not tab-cleaned, the 10-min TTL unchanged.

@@ -88,6 +88,30 @@ impl Runtime {
         }
     }
     pub fn add_url(&mut self, url: &str, queue_id: &str, referrer: &str, cookies: &str) -> String {
+        self.add_url_full(
+            url,
+            queue_id,
+            referrer,
+            cookies,
+            "",
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// Full-funnel add: like `add_url`, but also carries the structured
+    /// cookie jar (`cookies_json`) and custom headers. On a dedup hit,
+    /// non-empty incoming values refresh the stored ones; empty incoming
+    /// values never erase a captured session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_url_full(
+        &mut self,
+        url: &str,
+        queue_id: &str,
+        referrer: &str,
+        cookies: &str,
+        cookies_json: &str,
+        headers: &std::collections::BTreeMap<String, String>,
+    ) -> String {
         // Dedup exact URL: duplicate magnet = same librqbit handle shared by two
         // app tasks; removing one detaches other into never-finishing zombie.
         // A re-add of the same URL with fresher browser/session material
@@ -99,6 +123,12 @@ impl Runtime {
             }
             if !cookies.trim().is_empty() {
                 t.cookies = cookies.to_string();
+            }
+            if !cookies_json.trim().is_empty() {
+                t.cookies_json = cookies_json.to_string();
+            }
+            if !headers.is_empty() {
+                t.headers.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             return t.id.clone();
         }
@@ -140,6 +170,8 @@ impl Runtime {
             category: category_for(&filename).into(),
             referrer: referrer.to_string(),
             cookies: cookies.to_string(),
+            cookies_json: cookies_json.to_string(),
+            headers: headers.clone(),
             ..Default::default()
         };
         let id = task.id.clone();
@@ -830,6 +862,93 @@ mod state_tests {
             assert!(should_promote(stream, item, "page"), "item blocked: {item}");
         }
         assert!(!should_promote(stream, "https://example.com/file.mp4", ""));
+    }
+
+    #[test]
+    fn add_url_full_refreshes_dedup_and_keeps_on_empty() {
+        // add_url_full's create path saves state + appends history; build the
+        // task via the dedup-hit path instead (pre-seeded task, no save) so
+        // the test never touches the real user state file or env.
+        let mut rt = Runtime {
+            state: AppState::default(),
+            controls: HashMap::new(),
+            messages: Vec::new(),
+            clip_last: String::new(),
+            tray_visible: false,
+            pending_captures: Vec::new(),
+            pending_power: None,
+        };
+        let url = "https://example.com/file.zip";
+        // Seed the task directly: creation storing cookies_json/headers is
+        // covered by the struct literal in add_url_full; here we verify the
+        // dedup-refresh contract without invoking save()/history.
+        rt.state.tasks.push(DownloadTask {
+            id: "seed-id".to_string(),
+            url: url.to_string(),
+            referrer: "ref1".to_string(),
+            cookies: "c=1".to_string(),
+            cookies_json: "[{\"name\":\"a\"}]".to_string(),
+            headers: [("user-agent".to_string(), "UA1".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        let id1 = "seed-id".to_string();
+        assert_eq!(rt.state.tasks.len(), 1);
+        {
+            let t = &rt.state.tasks[0];
+            assert_eq!(t.referrer, "ref1");
+            assert_eq!(t.cookies, "c=1");
+            assert_eq!(t.cookies_json, "[{\"name\":\"a\"}]");
+            assert_eq!(t.headers.get("user-agent").map(|s| s.as_str()), Some("UA1"));
+        }
+        // Re-add same URL with fresh material: dedup hit refreshes all fields.
+        let h2: std::collections::BTreeMap<String, String> = [
+            ("user-agent".to_string(), "UA2".to_string()),
+            ("authorization".to_string(), "Bearer x".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let id2 = rt.add_url_full(url, "main", "ref2", "c=2", "[{\"name\":\"b\"}]", &h2);
+        assert_eq!(id1, id2, "dedup must reuse the existing task");
+        assert_eq!(rt.state.tasks.len(), 1);
+        {
+            let t = &rt.state.tasks[0];
+            assert_eq!(t.referrer, "ref2");
+            assert_eq!(t.cookies, "c=2");
+            assert_eq!(t.cookies_json, "[{\"name\":\"b\"}]");
+            assert_eq!(t.headers.get("user-agent").map(|s| s.as_str()), Some("UA2"));
+            assert_eq!(
+                t.headers.get("authorization").map(|s| s.as_str()),
+                Some("Bearer x")
+            );
+        }
+        // Empty incoming must not clear stored values.
+        let id3 = rt.add_url_full(
+            url,
+            "main",
+            "",
+            "",
+            "",
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(id1, id3);
+        assert_eq!(rt.state.tasks.len(), 1);
+        {
+            let t = &rt.state.tasks[0];
+            assert_eq!(t.referrer, "ref2");
+            assert_eq!(t.cookies, "c=2");
+            assert_eq!(t.cookies_json, "[{\"name\":\"b\"}]");
+            assert_eq!(t.headers.get("user-agent").map(|s| s.as_str()), Some("UA2"));
+            assert_eq!(
+                t.headers.get("authorization").map(|s| s.as_str()),
+                Some("Bearer x")
+            );
+        }
+        // Thin wrapper still dedups without clobbering.
+        let id4 = rt.add_url(url, "main", "", "");
+        assert_eq!(id1, id4);
+        assert_eq!(rt.state.tasks.len(), 1);
     }
 
     #[test]

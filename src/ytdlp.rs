@@ -502,9 +502,25 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
     if is_manifest_url(url) {
         a.push("--force-generic-extractor".into());
     }
-    if !task.referrer.is_empty() {
+    // Canonical Cookie/Referer: exactly one emission each, handled here;
+    // the header loop below skips both rows entirely. Cookie precedence:
+    // jar (--cookies) > task.cookies > `cookie` header row. Referer
+    // precedence: task.referrer (--referer) > `referer` header row.
+    let header_value = |name: &str| -> Option<String> {
+        task.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let cookie_header = header_value("cookie");
+    let referer_header = header_value("referer");
+    if !task.referrer.trim().is_empty() {
         a.push("--referer".into());
-        a.push(task.referrer.clone());
+        a.push(task.referrer.trim().to_string());
+    } else if let Some(referer) = &referer_header {
+        a.push("--add-header".into());
+        a.push(format!("Referer:{referer}"));
     }
     // Effective proxy resolved into task.proxy_url by caller (start_task /
     // probe task); bare yt-dlp subprocess honors no global setting itself.
@@ -515,13 +531,17 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
     if let Some(jar) = cookie_jar {
         a.push("--cookies".into());
         a.push(jar.to_string_lossy().into_owned());
-    } else if !task.cookies.is_empty() {
+    } else if !task.cookies.trim().is_empty() {
         a.push("--add-header".into());
-        a.push(format!("Cookie:{}", task.cookies));
+        a.push(format!("Cookie:{}", task.cookies.trim()));
+    } else if let Some(cookie) = &cookie_header {
+        a.push("--add-header".into());
+        a.push(format!("Cookie:{cookie}"));
     }
     for (k, v) in &task.headers {
         // Pseudo-headers are task config, never HTTP headers.
-        // With a jar, Cookie comes from file; user Cookie header would duplicate/override.
+        // Cookie/Referer rows are handled canonically above; replaying
+        // them here would duplicate (or override the jar/task values).
         // Denied wire headers (Range, accept-encoding, ...) are stack-owned
         // or response/hop-by-hop names: yt-dlp must not replay them either.
         if YT_HEADER_KEYS.iter().any(|x| k.eq_ignore_ascii_case(x))
@@ -532,7 +552,8 @@ fn base_args(url: &str, task: &DownloadTask, cookie_jar: Option<&std::path::Path
             || k.eq_ignore_ascii_case("x-rep-id")
             || k.eq_ignore_ascii_case("x-variant-index")
             || k.eq_ignore_ascii_case("x-nzb")
-            || (cookie_jar.is_some() && k.eq_ignore_ascii_case("cookie"))
+            || k.eq_ignore_ascii_case("cookie")
+            || k.eq_ignore_ascii_case("referer")
             || crate::engine::is_denied_wire_header(k)
         {
             continue;
@@ -2294,6 +2315,95 @@ mod tests {
             ..Default::default()
         };
         assert!(write_cookie_jar(&t).is_none());
+    }
+
+    #[test]
+    fn base_args_cookie_from_task_cookies_emitted_once() {
+        let t = crate::model::DownloadTask {
+            cookies: "a=1; b=2".into(),
+            ..Default::default()
+        };
+        let a = base_args("https://x/watch", &t, None);
+        let hits: Vec<&String> = a
+            .iter()
+            .filter(|x| x.to_ascii_lowercase().starts_with("cookie:"))
+            .collect();
+        assert_eq!(hits, [&"Cookie:a=1; b=2".to_string()], "args {a:?}");
+        assert!(!a.iter().any(|x| x == "--cookies"), "args {a:?}");
+    }
+
+    #[test]
+    fn base_args_cookie_from_header_row_when_task_cookies_empty() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("Cookie".to_string(), "x=1".to_string());
+        let t = crate::model::DownloadTask {
+            headers: h,
+            // Garbage JSON must not block the header-row fallback.
+            cookies_json: "not-json".into(),
+            ..Default::default()
+        };
+        assert!(write_cookie_jar(&t).is_none());
+        let a = base_args("https://x/watch", &t, None);
+        let hits: Vec<&String> = a
+            .iter()
+            .filter(|x| x.to_ascii_lowercase().starts_with("cookie:"))
+            .collect();
+        assert_eq!(hits, [&"Cookie:x=1".to_string()], "args {a:?}");
+    }
+
+    #[test]
+    fn base_args_cookie_and_referer_rows_suppressed_when_task_fields_set() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("Cookie".to_string(), "row=1".to_string());
+        h.insert("Referer".to_string(), "https://row.example/".to_string());
+        let t = crate::model::DownloadTask {
+            cookies: "task=1".into(),
+            referrer: "https://task.example/".into(),
+            headers: h,
+            ..Default::default()
+        };
+        let a = base_args("https://x/watch", &t, None);
+        let cookies: Vec<&String> = a
+            .iter()
+            .filter(|x| x.to_ascii_lowercase().starts_with("cookie:"))
+            .collect();
+        assert_eq!(cookies, [&"Cookie:task=1".to_string()], "args {a:?}");
+        // Referer exactly once, from task.referrer via --referer; row suppressed.
+        let mut referer_count = a
+            .windows(2)
+            .filter(|w| w[0] == "--referer" && w[1] == "https://task.example/")
+            .count();
+        referer_count += a
+            .iter()
+            .filter(|x| x.to_ascii_lowercase().starts_with("referer:"))
+            .count();
+        assert_eq!(referer_count, 1, "args {a:?}");
+        assert!(
+            !a.iter().any(|x| x.contains("row.example")),
+            "row referer leaked: {a:?}"
+        );
+    }
+
+    #[test]
+    fn base_args_jar_suppresses_cookie_row_and_task_cookies() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("Cookie".to_string(), "row=1".to_string());
+        let t = crate::model::DownloadTask {
+            cookies: "task=1".into(),
+            headers: h,
+            ..Default::default()
+        };
+        let a = base_args(
+            "https://x/watch",
+            &t,
+            Some(std::path::Path::new("jar.txt")),
+        );
+        assert!(a.iter().any(|x| x == "--cookies"), "args {a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.to_ascii_lowercase().starts_with("cookie:")),
+            "args {a:?}"
+        );
     }
 
     #[test]

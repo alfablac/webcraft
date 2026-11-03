@@ -203,6 +203,26 @@ function filenameFromDisp(disp, url) {
   if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
   return filenameFromUrl(url);
 }
+function tabIdForUrl(url) {
+  // DownloadItem exposes no tabId, so captured downloads recover their
+  // originating tab by URL from the webRequest-era Maps; most recent wins.
+  // hops/redirectFrom match redirect chains (item URL is the final URL).
+  if (!url) return null;
+  let best = null;
+  const scan = (r) => {
+    if (!r || !(r.tabId >= 0)) return;
+    const hit = r.url === url || r.redirectFrom === url || (Array.isArray(r.hops) && r.hops.includes(url));
+    if (hit && (!best || (r.time || 0) >= (best.time || 0))) best = r;
+  };
+  for (const r of requestRecords.values()) scan(r);
+  for (const c of candidates.values()) scan(c);
+  return best ? best.tabId : null;
+}
+async function tabForUrl(url) {
+  const tabId = tabIdForUrl(url);
+  if (tabId == null) return null;
+  try { return await browser.tabs.get(tabId); } catch (e) { return null; }
+}
 function filenameFromUrl(u) { try { const p = new URL(u).pathname; const last = p.split("/").pop(); return last ? decodeURIComponent(last) : ""; } catch (e) { return ""; } }
 function basename(name) { return name ? String(name).split(/[\\/]/).pop() || "" : ""; }
 // IDM takeover rules: status ok, attachment, binary/media type, or known file extension.
@@ -293,8 +313,13 @@ async function sendDownload(url, tab, extra = {}) {
   // Last-seen browser headers for this URL (exact or origin+path index);
   // UA + Accept-Language synthesis so the engine never has to fall back
   // to the webcraft UA on never-requested URLs.
+  // Fallback: the tab's current URL (exact or origin+path index).
+  // content.js sends canonicalized page URLs (shorts->watch, /photo/N
+  // stripped, tracking params dropped), so the stored navigation
+  // headers may exist only under the real, uncleaned tab URL.
   try {
-    const got = urlHeaders.get(url) || urlHeaders.get(headerKeyIndex(url));
+    let got = urlHeaders.get(url) || urlHeaders.get(headerKeyIndex(url));
+    if (!got && tab && tab.url) got = urlHeaders.get(tab.url) || urlHeaders.get(headerKeyIndex(tab.url));
     const headers = { ...(got && got.headers ? got.headers : {}) };
     if (!headers["user-agent"] && typeof navigator !== "undefined" && navigator.userAgent) headers["user-agent"] = navigator.userAgent;
     if (!headers["accept-language"] && typeof navigator !== "undefined" && Array.isArray(navigator.languages) && navigator.languages.length) headers["accept-language"] = navigator.languages.join(",");
@@ -383,7 +408,7 @@ browser.downloads.onCreated.addListener((item) => {
       markBypass(entry.url); // BEFORE send: re-entrant onCreated must skip
       await browser.downloads.removeFile(id).catch(() => {}); // drop cancelled partial: webcraft owns file now
       try { await browser.downloads.erase({ id }).catch(() => {}); } catch (e) {}
-      const resp = await safeSend(entry.url, null, { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
+      const resp = await safeSend(entry.url, await tabForUrl(entry.url), { referrer: entry.referrer, filename: entry.filename, mime: entry.mime, size: entry.size, captured: true });
       if (!resp || resp.skipped || resp.type === "error") browserDownload(entry).catch(() => {}); // skipped/error: already cancelled, re-download in browser
     } catch (e) { browserDownload(entry).catch(() => {}); } // host died mid-send: file must not vanish
   })().catch(() => {});

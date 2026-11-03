@@ -746,6 +746,10 @@ pub struct DownloadApp {
     grab_exclude_paths: String,
     grab_files: Vec<FoundFile>,
     grab_cookies: String,
+    /// Structured browser cookies (cookiesJson from pending-grab.json).
+    /// Retained alongside grab_cookies for future grabber use; not yet
+    /// wired into grabber.rs.
+    grab_cookies_json: String,
     grab_project_json: String,
     grab_status: String,
     grab_busy: bool,
@@ -1108,6 +1112,7 @@ impl DownloadApp {
             grab_exclude_paths: String::new(),
             grab_files: Vec::new(),
             grab_cookies: String::new(),
+            grab_cookies_json: String::new(),
             grab_project_json: String::new(),
             grab_status: "Enter a start URL, then Explore.".into(),
             grab_busy: false,
@@ -2478,7 +2483,7 @@ impl DownloadApp {
         {
             let pj = crate::platform::config_dir().join("pending-grab.json");
             let pt = crate::platform::config_dir().join("pending-grab.txt");
-            let mut pending: Option<(String, String)> = None;
+            let mut pending: Option<(String, String, String)> = None;
             // Delete only when accepted below; busy/corrupt = retry next poll.
             if !self.grab_busy {
                 if let Ok(s) = std::fs::read_to_string(&pj) {
@@ -2487,6 +2492,10 @@ impl DownloadApp {
                             (
                                 u.to_string(),
                                 v.get("cookies")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                v.get("cookiesJson")
                                     .and_then(|c| c.as_str())
                                     .unwrap_or("")
                                     .to_string(),
@@ -2502,14 +2511,15 @@ impl DownloadApp {
                         let u = s.trim().to_string();
                         if !u.is_empty() {
                             let _ = std::fs::remove_file(&pt);
-                            pending = Some((u, String::new()));
+                            pending = Some((u, String::new(), String::new()));
                         }
                     }
                 }
             }
-            if let Some((u, cookies)) = pending {
+            if let Some((u, cookies, cookies_json)) = pending {
                 self.grab_url = u;
                 self.grab_cookies = cookies;
+                self.grab_cookies_json = cookies_json;
                 self.tab = Tab::Grabber;
                 self.grab_auto_explore = true;
                 self.show_window(ctx);
@@ -6115,7 +6125,10 @@ fn ui_chat_markdown(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Start silent yt-dlp -J probe (thread + slot, torrent-picker pattern).
-/// Probe task carries referrer/cookies so gated pages (X/Reddit) resolve.
+/// Probe task carries referrer/cookies/headers so gated pages (X/Reddit) resolve.
+/// Full headers map is passed through: ytdlp::base_args strips pseudo-headers
+/// (YT_HEADER_KEYS, x-page-*) and denied wire headers itself.
+#[allow(clippy::too_many_arguments)]
 fn start_yt_probe(
     st: &mut YtProbeState,
     rt: &tokio::runtime::Runtime,
@@ -6123,6 +6136,7 @@ fn start_yt_probe(
     referrer: &str,
     cookies: &str,
     cookies_json: &str,
+    headers: &std::collections::BTreeMap<String, String>,
     proxy: &str,
 ) {
     let slot: YtProbeSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -6143,6 +6157,7 @@ fn start_yt_probe(
         referrer: referrer.to_string(),
         cookies: cookies.to_string(),
         cookies_json: cookies_json.to_string(),
+        headers: headers.clone(),
         proxy_url: proxy.to_string(),
         ..Default::default()
     };
@@ -6285,6 +6300,7 @@ fn ui_yt_probe_section(
     referrer: &str,
     cookies: &str,
     cookies_json: &str,
+    headers: &std::collections::BTreeMap<String, String>,
     rt: &tokio::runtime::Runtime,
     proxy: &str,
 ) {
@@ -6323,7 +6339,7 @@ fn ui_yt_probe_section(
             });
         if ui::secondary_button(ui, "Retry probe").clicked() {
             st.proxy_used = proxy.to_string();
-            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, headers, proxy);
         }
         return;
     }
@@ -6337,7 +6353,7 @@ fn ui_yt_probe_section(
         }
         if ui::secondary_button(ui, "Probe formats (quality / audio / subtitles)").clicked() {
             st.proxy_used = proxy.to_string();
-            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, proxy);
+            start_yt_probe(st, rt, url, referrer, cookies, cookies_json, headers, proxy);
         }
         return;
     };
@@ -7476,6 +7492,7 @@ impl DownloadApp {
                             &t.referrer,
                             &t.cookies,
                             &t.cookies_json,
+                            &t.headers,
                             &eff_proxy,
                         );
                     }
@@ -7497,6 +7514,7 @@ impl DownloadApp {
                         &r,
                         &c,
                         &t.cookies_json,
+                        &t.headers,
                         &rt,
                         &eff_proxy,
                     );
@@ -8295,10 +8313,21 @@ impl DownloadApp {
                     if yt_probe_eligible(app.add_url.trim()) {
                         ui.add_space(theme::SP_SM);
                         let (u, r, c, cj) = (app.add_url.trim().to_string(), app.add_referrer.clone(), app.add_cookies.clone(), app.add_cookies_json.clone());
+                        // Same normalization as the confirm path (line ~8528):
+                        // probe must send exactly the headers the download will.
+                        let hdrs: std::collections::BTreeMap<String, String> = app
+                            .add_headers
+                            .iter()
+                            .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
+                            .filter(|(n, v)| {
+                                !(n.is_empty() && v.is_empty()) && header_row_error(n, v).is_none()
+                            })
+                            .map(|(n, v)| (n.to_ascii_lowercase(), v))
+                            .collect();
                         let rt = app.tokio_rt.clone();
                         let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
                         let eff_proxy = crate::model::effective_proxy(&app.add_proxy, &global_proxy).to_string();
-                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, &cj, &rt, &eff_proxy);
+                        ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, &cj, &hdrs, &rt, &eff_proxy);
                     } else if !app.add_url.trim().is_empty() {
                         // HTTP prewarm: stable probe-able URL spawns background
                         // probe+plan; confirm never waits for it.
@@ -8682,7 +8711,14 @@ impl DownloadApp {
                 }
                 let id = {
                     let mut g = crate::lock_unpoison(&self.rt);
-                    let id = g.add_url(&url, &queue, &referrer, &cookies);
+                    let id = g.add_url_full(
+                        &url,
+                        &queue,
+                        &referrer,
+                        &cookies,
+                        &self.add_cookies_json,
+                        &custom_headers,
+                    );
                     // NZB uses separate NNTP connections knob, not HTTP max_connections.
                     let segs = if crate::stream::is_nzb_url_str(&url) {
                         g.state.settings.nntp_connections
@@ -12317,6 +12353,8 @@ impl DownloadApp {
                                 if let Ok(proj) = serde_json::from_str::<GrabberProject>(&t) {
                                     self.grab_url = proj.start_url;
                                     self.grab_cookies = proj.cookies.clone();
+                                    // Project files carry no structured jar.
+                                    self.grab_cookies_json.clear();
                                     self.grab_depth = proj.depth;
                                     self.grab_ext_depth = proj.external_depth;
                                     self.grab_scope = proj.scope;

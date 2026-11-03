@@ -2,6 +2,33 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.26.0] - 2026-11-03
+
+### Fixed
+
+- yt-dlp downloads (and the silent format probe) now actually receive the
+  browser cookies and special/captured headers attached to a task. A task
+  previously passed cookies + headers to webcraft's native engine only;
+  yt-dlp got either no cookie (or a duplicated/stale one when the header
+  list also carried Cookie/Referer rows). `--cookies` (Netscape jar from
+  the extension-captured cookie JSON) is preferred, then the plain cookie
+  string (`--add-header Cookie:`), then any literal Cookie row; exactly
+  one cookie source and one Referer are emitted (`src/ytdlp.rs`).
+- The yt-dlp silent probe now forwards the task/dialog headers map, so
+  gated pages (X/Reddit/forums) that resolve only with the captured
+  Accept-Language/User-Agent/etc. no longer fail before the format list
+  appears.
+- The Add dialog now preserves referrer/cookies/cookie-JSON/headers on
+  duplicate submission too (new `add_url_full` path refreshes those fields
+  on the existing task instead of dropping them on the "already in queue"
+  no-op), and pending browser grabs import the captured `cookiesJson` into
+  the Add dialog instead of silently discarding it.
+- Browser extensions: Chromium now reads cookies from the correct
+  (incognito) cookie store, captured downloads can recover their
+  originating tab instead of sending a bare URL, and persisted per-URL
+  headers survive (Authorization no longer stripped) and are awaited
+  before sending.
+
 ## [0.25.1] - 2026-10-26
 
 ### Added
