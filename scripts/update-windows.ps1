@@ -17,11 +17,17 @@
 #       Override the install dir (default: dist\ next to the repo).
 #   .\scripts\update-windows.ps1 -NoLaunch
 #       Install only; do not relaunch the GUI.
+#   .\scripts\update-windows.ps1 -NoCleanup
+#       Skip the stray-.exe sweep (default: remove duplicate/stale webcraft
+#       exes in the install dir and under target\, e.g. "webcraft-host (2).exe",
+#       *.new/*.older leftovers, target\debug copies). Locked files are
+#       skipped and reported, never fatal.
 
 param(
     [string]$SourceDir,
     [string]$InstallDir,
-    [switch]$NoLaunch
+    [switch]$NoLaunch,
+    [switch]$NoCleanup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +56,38 @@ function Stop-WebcraftOnce {
     foreach ($p in @(Get-WebcraftProcesses)) {
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
     }
+}
+
+# Stray webcraft exes: browser "save as" duplicates ("webcraft-host (2).exe"),
+# staged/rollback leftovers (*.exe.new, *.exe.older), and build-output copies
+# under target\ (debug/deps). The canonical binaries (install dir + the
+# -SourceDir pair) are never touched. Locked files (a respawned host can hold
+# a *.older open) are skipped and reported; cleanup is never fatal.
+function Remove-StrayExes {
+    param([string[]]$Keep)
+    $keepSet = @{}
+    foreach ($k in $Keep) { if ($k) { $keepSet[(Resolve-Path $k -ErrorAction SilentlyContinue).Path] = $true } }
+    $candidates = @()
+    # Install dir: anything webcraft*.exe* that is not a canonical binary.
+    $candidates += Get-ChildItem $InstallDir -Filter 'webcraft*.exe*' -File -ErrorAction SilentlyContinue
+    # Repo build output: every webcraft exe under target\ except the source pair.
+    $targetDir = Join-Path $RepoRoot 'target'
+    if (Test-Path $targetDir) {
+        $candidates += Get-ChildItem $targetDir -Recurse -Filter 'webcraft*.exe' -File -ErrorAction SilentlyContinue
+    }
+    $removed = 0; $skipped = 0
+    foreach ($f in @($candidates | Sort-Object FullName -Unique)) {
+        if ($keepSet.ContainsKey($f.FullName)) { continue }
+        try {
+            Remove-Item $f.FullName -Force -ErrorAction Stop
+            Write-Host "cleaned stray: $($f.FullName)"
+            $removed++
+        } catch {
+            Write-Host "cleanup skipped (locked?): $($f.FullName)"
+            $skipped++
+        }
+    }
+    Write-Host "cleanup: $removed removed, $skipped skipped"
 }
 
 # ---------------------------------------------------------------------- main
@@ -119,6 +157,14 @@ foreach ($name in $ExeNames) {
 }
 
 & (Join-Path $InstallDir 'webcraft.exe') --register-hosts | Write-Host
+
+# Sweep strays last: the swap above (and any browser respawn during it) is
+# what creates them; canonical install + source binaries are kept.
+if (-not $NoCleanup) {
+    $keep = @($ExeNames | ForEach-Object { Join-Path $InstallDir $_ }) +
+            @($ExeNames | ForEach-Object { Join-Path $SourceDir $_ })
+    Remove-StrayExes -Keep $keep
+}
 
 if (-not $NoLaunch) {
     Start-Process -FilePath (Join-Path $InstallDir 'webcraft.exe') -ArgumentList '--show' `
