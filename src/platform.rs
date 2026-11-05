@@ -54,7 +54,8 @@ pub fn write_button_style(settings: &crate::model::Settings) {
     let _ = std::fs::create_dir_all(config_dir());
     let _ = std::fs::write(
         config_dir().join("button-style.json"),
-        serde_json::json!({"preset": p.id, "icon": p.icon, "w": p.w, "h": p.h, "radius": p.radius}).to_string(),
+        serde_json::json!({"preset": p.id, "icon": p.icon, "w": p.w, "h": p.h, "radius": p.radius})
+            .to_string(),
     );
 }
 

@@ -436,7 +436,8 @@ pub fn extract_url(text: &str) -> Option<String> {
     for tok in text.split_whitespace() {
         let tok = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | '<' | '>' | '(' | ')'));
         if let Some(pos) = tok.find("http://").or_else(|| tok.find("https://")) {
-            let url = tok[pos..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'']);
+            let url =
+                tok[pos..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'']);
             if url.len() > 8 && !url.contains(char::is_whitespace) {
                 return Some(url.to_string());
             }
@@ -447,7 +448,10 @@ pub fn extract_url(text: &str) -> Option<String> {
 
 /// DuckDuckGo HTML endpoint (no API key). Results parsed by caller.
 pub fn ddg_search_url(query: &str) -> String {
-    format!("https://html.duckduckgo.com/html/?q={}", form_encode(query.trim()))
+    format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        form_encode(query.trim())
+    )
 }
 
 /// Parse DDG html results: (title, url) pairs from `result__a` anchors.
@@ -457,9 +461,13 @@ pub fn parse_ddg_results(html: &str, max: usize) -> Vec<(String, String)> {
     let mut rest = html;
     while let Some(pos) = rest.find("result__a") {
         rest = &rest[pos..];
-        let Some(href_start) = rest.find("href=\"") else { break };
+        let Some(href_start) = rest.find("href=\"") else {
+            break;
+        };
         rest = &rest[href_start + 6..];
-        let Some(href_end) = rest.find('"') else { break };
+        let Some(href_end) = rest.find('"') else {
+            break;
+        };
         let href = &rest[..href_end];
         let Some(gt) = rest.find('>') else { break };
         rest = &rest[gt + 1..];
@@ -520,12 +528,19 @@ pub fn strip_tags(html: &str) -> String {
             let Some(te) = tag_end else { break };
             let tag = &lower[i..te];
             if tag.starts_with("<script") || tag.starts_with("<style") {
-                let close = if tag.starts_with("<script") { "</script" } else { "</style" };
+                let close = if tag.starts_with("<script") {
+                    "</script"
+                } else {
+                    "</style"
+                };
                 match lower[te..].find(close) {
                     Some(p) => {
                         // Skip past the closing tag's '>' as well.
                         let after = te + p + close.len();
-                        i = html[after..].find('>').map(|g| after + g + 1).unwrap_or(html.len());
+                        i = html[after..]
+                            .find('>')
+                            .map(|g| after + g + 1)
+                            .unwrap_or(html.len());
                         continue;
                     }
                     None => break,
@@ -752,9 +767,13 @@ mod tests {
         <a class="result__a" href="https://rust-lang.org">Rust</a>"#;
         let r = parse_ddg_results(html, 5);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0], ("Title & One".into(), "https://example.com/a?x=1".into()));
+        assert_eq!(
+            r[0],
+            ("Title & One".into(), "https://example.com/a?x=1".into())
+        );
         assert_eq!(r[1].1, "https://rust-lang.org");
-        let txt = strip_tags("<style>x{}</style><p>Olá <b>mundo</b></p><script>evil()</script> fim");
+        let txt =
+            strip_tags("<style>x{}</style><p>Olá <b>mundo</b></p><script>evil()</script> fim");
         assert_eq!(txt, "Olá mundo fim");
     }
 

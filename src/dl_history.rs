@@ -608,7 +608,11 @@ pub fn record(
 
 /// Append global aggregate speed sample (`bps` bytes/sec at `ts_ms`).
 pub fn append_speed(dir: &Path, ts_ms: u64, bps: f64) {
-    let bps = if bps.is_finite() && bps > 0.0 { bps } else { 0.0 };
+    let bps = if bps.is_finite() && bps > 0.0 {
+        bps
+    } else {
+        0.0
+    };
     append_event(
         dir,
         &DlEvent {
@@ -818,11 +822,7 @@ pub fn speed_series(events: &[DlEvent], bucket_ms: u64) -> Vec<SpeedPoint> {
 }
 
 /// Pure: per-task bucket-averaged series from cumulative samples.
-pub fn task_speed_series(
-    events: &[DlEvent],
-    task_id: &str,
-    bucket_ms: u64,
-) -> Vec<SpeedPoint> {
+pub fn task_speed_series(events: &[DlEvent], task_id: &str, bucket_ms: u64) -> Vec<SpeedPoint> {
     let mut ev: Vec<DlEvent> = events
         .iter()
         .filter(|e| e.kind == KIND_SPEED && e.task_id == task_id)
@@ -845,12 +845,7 @@ pub fn task_speed_series(
 }
 
 /// Global speed series loaded from daily files in range, bucket-averaged.
-pub fn load_speed_series(
-    dir: &Path,
-    from_ms: u64,
-    to_ms: u64,
-    bucket_ms: u64,
-) -> Vec<SpeedPoint> {
+pub fn load_speed_series(dir: &Path, from_ms: u64, to_ms: u64, bucket_ms: u64) -> Vec<SpeedPoint> {
     speed_series(&load_range(dir, from_ms, to_ms), bucket_ms)
 }
 
@@ -970,10 +965,8 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "webcraft-dl-history-{}-{name}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("webcraft-dl-history-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
@@ -1054,8 +1047,7 @@ mod tests {
             dir.join(format!("dl-{}.jsonl", day_stamp(T0))),
             format!(
                 "{}\nnot json {{\n",
-                std::fs::read_to_string(dir.join(format!("dl-{}.jsonl", day_stamp(T0))))
-                    .unwrap()
+                std::fs::read_to_string(dir.join(format!("dl-{}.jsonl", day_stamp(T0)))).unwrap()
             ),
         )
         .unwrap();
@@ -1079,7 +1071,8 @@ mod tests {
         assert_eq!(load_day(&dir, T0 + DAY).len(), 1);
         assert_eq!(load_range(&tmp("missing"), 0, u64::MAX).len(), 0);
         // Serde forward-compat: missing optional fields default.
-        let e: DlEvent = serde_json::from_str(r#"{"ts_ms":1,"kind":"added","task_id":"t"}"#).unwrap();
+        let e: DlEvent =
+            serde_json::from_str(r#"{"ts_ms":1,"kind":"added","task_id":"t"}"#).unwrap();
         assert_eq!(e.bytes, 0);
         assert_eq!(e.url_host, "");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1089,17 +1082,32 @@ mod tests {
     fn speed_series_bucket_average() {
         // Global samples: buckets of 10s.
         let evs = vec![
-            DlEvent { bytes: 1000, ..ev(0, KIND_SPEED, "") },
-            DlEvent { bytes: 3000, ..ev(5_000, KIND_SPEED, "") },
-            DlEvent { bytes: 5000, ..ev(12_000, KIND_SPEED, "") },
+            DlEvent {
+                bytes: 1000,
+                ..ev(0, KIND_SPEED, "")
+            },
+            DlEvent {
+                bytes: 3000,
+                ..ev(5_000, KIND_SPEED, "")
+            },
+            DlEvent {
+                bytes: 5000,
+                ..ev(12_000, KIND_SPEED, "")
+            },
             ev(1_000, KIND_COMPLETED, "x"), // ignored
         ];
         let s = speed_series(&evs, 10_000);
         assert_eq!(
             s,
             vec![
-                SpeedPoint { ts_ms: 0, bps: 2000.0 },
-                SpeedPoint { ts_ms: 10_000, bps: 5000.0 },
+                SpeedPoint {
+                    ts_ms: 0,
+                    bps: 2000.0
+                },
+                SpeedPoint {
+                    ts_ms: 10_000,
+                    bps: 5000.0
+                },
             ]
         );
         assert!(speed_series(&evs, 0).is_empty());
@@ -1107,11 +1115,26 @@ mod tests {
 
         // Per-task cumulative: 0->2000 B in 1s, then +3000 B in 1s.
         let evs = vec![
-            DlEvent { bytes: 0, ..ev(0, KIND_SPEED, "a") },
-            DlEvent { bytes: 2000, ..ev(1_000, KIND_SPEED, "a") },
-            DlEvent { bytes: 5000, ..ev(2_000, KIND_SPEED, "a") },
-            DlEvent { bytes: 100, ..ev(0, KIND_SPEED, "b") },
-            DlEvent { bytes: 1100, ..ev(1_000, KIND_SPEED, "b") },
+            DlEvent {
+                bytes: 0,
+                ..ev(0, KIND_SPEED, "a")
+            },
+            DlEvent {
+                bytes: 2000,
+                ..ev(1_000, KIND_SPEED, "a")
+            },
+            DlEvent {
+                bytes: 5000,
+                ..ev(2_000, KIND_SPEED, "a")
+            },
+            DlEvent {
+                bytes: 100,
+                ..ev(0, KIND_SPEED, "b")
+            },
+            DlEvent {
+                bytes: 1100,
+                ..ev(1_000, KIND_SPEED, "b")
+            },
         ];
         let t = task_speed_series(&evs, "a", 60_000);
         assert_eq!(t.len(), 1);
@@ -1142,9 +1165,22 @@ mod tests {
     #[test]
     fn stats_from_completions() {
         let evs = vec![
-            DlEvent { bytes: 2000, duration_ms: 1000, ..ev(0, KIND_COMPLETED, "a") },
-            DlEvent { bytes: 0, total: 3000, duration_ms: 1000, ..ev(1, KIND_COMPLETED, "b") },
-            DlEvent { bytes: 9999, duration_ms: 1, ..ev(2, KIND_FAILED, "c") },
+            DlEvent {
+                bytes: 2000,
+                duration_ms: 1000,
+                ..ev(0, KIND_COMPLETED, "a")
+            },
+            DlEvent {
+                bytes: 0,
+                total: 3000,
+                duration_ms: 1000,
+                ..ev(1, KIND_COMPLETED, "b")
+            },
+            DlEvent {
+                bytes: 9999,
+                duration_ms: 1,
+                ..ev(2, KIND_FAILED, "c")
+            },
             ev(3, KIND_SPEED, ""),
         ];
         let s = stats(&evs);

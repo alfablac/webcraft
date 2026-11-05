@@ -201,13 +201,7 @@ fn load_capture_filter() -> (Vec<String>, u64) {
 /// app's preset table; defaults = "arrow-m" when file missing/corrupt.
 fn load_button_style() -> (String, String, u64, u64, String) {
     fn defaults() -> (String, String, u64, u64, String) {
-        (
-            "arrow-m".into(),
-            "arrow".into(),
-            27,
-            27,
-            "50%".into(),
-        )
+        ("arrow-m".into(), "arrow".into(), 27, 27, "50%".into())
     }
     let Ok(txt) = std::fs::read_to_string(config_dir().join("button-style.json")) else {
         return defaults();
@@ -256,7 +250,9 @@ fn recent_duplicate(dir: &std::path::Path, url: &str, now: std::time::SystemTime
     };
     rd.flatten().any(|e| {
         let name = e.file_name();
-        let Some(name) = name.to_str() else { return false };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
         if !name.starts_with("msg-") || !name.ends_with(".txt") {
             return false;
         }
@@ -354,7 +350,9 @@ fn handle(msg: &serde_json::Value) -> serde_json::Value {
         // host reads button-style.json fresh per call (applies live).
         "getButtonStyle" => {
             let (preset, icon, w, h, radius) = load_button_style();
-            with_id(serde_json::json!({"type":"buttonStyle","preset":preset,"icon":icon,"w":w,"h":h,"radius":radius}))
+            with_id(
+                serde_json::json!({"type":"buttonStyle","preset":preset,"icon":icon,"w":w,"h":h,"radius":radius}),
+            )
         }
         "pollResume" => {
             let now_ms = std::time::SystemTime::now()
@@ -750,10 +748,8 @@ mod tests {
     }
 
     fn temp_resume(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "webcraft-host-resume-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-host-resume-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -784,13 +780,19 @@ mod tests {
             "resume-5.json",
             serde_json::json!({"url":"ftp://x/c.zip","ts":now_ms}).to_string(),
         );
-        w("other.json", serde_json::json!({"url":"https://x/d.zip","ts":now_ms}).to_string());
+        w(
+            "other.json",
+            serde_json::json!({"url":"https://x/d.zip","ts":now_ms}).to_string(),
+        );
         let items = take_resume_items(&dir, now_ms);
         assert_eq!(items.len(), 2);
         let mut urls: Vec<&str> = items.iter().filter_map(|i| i["url"].as_str()).collect();
         urls.sort();
         assert_eq!(urls, ["http://x/b.zip", "https://x/a.zip"]);
-        let a = items.iter().find(|i| i["url"] == "https://x/a.zip").unwrap();
+        let a = items
+            .iter()
+            .find(|i| i["url"] == "https://x/a.zip")
+            .unwrap();
         assert_eq!(a["filename"], "a.zip");
         assert_eq!(a["referrer"], "https://r/");
         assert_eq!(a["ts"], now_ms);
@@ -805,11 +807,10 @@ mod tests {
 
     #[test]
     fn take_resume_items_missing_dir_and_cap() {
-        assert!(take_resume_items(
-            &std::env::temp_dir().join("webcraft-host-resume-nope"),
-            0
-        )
-        .is_empty());
+        assert!(
+            take_resume_items(&std::env::temp_dir().join("webcraft-host-resume-nope"), 0)
+                .is_empty()
+        );
         let dir = temp_resume("cap");
         let now_ms = 1_000_000u64;
         for i in 0..12 {
@@ -824,10 +825,8 @@ mod tests {
     }
 
     fn temp_inbox(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "webcraft-host-dedupe-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("webcraft-host-dedupe-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -864,11 +863,7 @@ mod tests {
         // Non-msg file never matches.
         assert!(!recent_duplicate(&dir, "https://x/b.zip", now));
         // Missing dir: no dup.
-        assert!(!recent_duplicate(
-            &dir.join("nope"),
-            "https://x/a.zip",
-            now
-        ));
+        assert!(!recent_duplicate(&dir.join("nope"), "https://x/a.zip", now));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1189,7 +1189,10 @@ pub async fn resolve_hoster_result(
     // handled natively in `crate::transferit`. Hard-reject so no caller
     // can translate a transfer URL into a provider call by accident.
     if crate::transferit::is_task_url(url) {
-        return (Err("transfer.it is not supported by debrid providers".into()), true);
+        return (
+            Err("transfer.it is not supported by debrid providers".into()),
+            true,
+        );
     }
     // Google Drive: direct-only. Hard-reject as backstop so no caller can
     // unrestrict a Drive URL by accident; the dispatcher skips debrid for
@@ -1433,18 +1436,19 @@ pub async fn download_via_debrid(
                 };
                 let rd = crate::debrid_rd::RdClient::new(rd_cfg.api_key.clone(), http.clone());
                 let entry = match rd.unrestrict_folder(&share_url).await {
-                    Ok(entries) => match pick_rd_folder_link(&entries, &picked.handle, &picked.name)
-                    {
-                        Some(e) => e.clone(),
-                        None => {
-                            provider_err = Some(format!(
-                                "{}: MEGA folder link matched none of {} folder entries",
-                                Provider::Rd.label(),
-                                entries.len()
-                            ));
-                            break 'rd_folder;
+                    Ok(entries) => {
+                        match pick_rd_folder_link(&entries, &picked.handle, &picked.name) {
+                            Some(e) => e.clone(),
+                            None => {
+                                provider_err = Some(format!(
+                                    "{}: MEGA folder link matched none of {} folder entries",
+                                    Provider::Rd.label(),
+                                    entries.len()
+                                ));
+                                break 'rd_folder;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         provider_err = Some(prefixed(Provider::Rd.label(), &e));
                         break 'rd_folder;
@@ -1455,13 +1459,7 @@ pub async fn download_via_debrid(
                 let resolved = if crate::debrid_rd::url_host(&entry.link)
                     .is_some_and(|h| matches!(h.as_str(), "mega.nz" | "mega.co.nz" | "mega.io"))
                 {
-                    match unrestrict(
-                        http.clone(),
-                        Provider::Rd,
-                        &rd_cfg.api_key,
-                        &entry.link,
-                    )
-                    .await
+                    match unrestrict(http.clone(), Provider::Rd, &rd_cfg.api_key, &entry.link).await
                     {
                         Ok(f) => f,
                         Err(e) => {
@@ -1577,21 +1575,22 @@ pub async fn download_via_debrid(
         }
         ctrl.encrypted_payload
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let mut dl_url = match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
-            Ok((u, _)) => u,
-            Err(e) => {
-                ctrl.encrypted_payload
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                if let Ok(mut k) = ctrl.state_key.lock() {
-                    *k = None;
+        let mut dl_url =
+            match crate::mega::node_download_url(&http, &folder.id, &picked.handle).await {
+                Ok((u, _)) => u,
+                Err(e) => {
+                    ctrl.encrypted_payload
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut k) = ctrl.state_key.lock() {
+                        *k = None;
+                    }
+                    let msg = match provider_err {
+                        Some(pe) => format!("MEGA direct download failed: {e} (provider: {pe})"),
+                        None => format!("MEGA direct download failed: {e}"),
+                    };
+                    return Err((msg, true));
                 }
-                let msg = match provider_err {
-                    Some(pe) => format!("MEGA direct download failed: {e} (provider: {pe})"),
-                    None => format!("MEGA direct download failed: {e}"),
-                };
-                return Err((msg, true));
-            }
-        };
+            };
         task.debrid_info = format_debrid_info("MEGA direct", &url_host(&original_url), None);
         let debrid_info = task.debrid_info.clone();
         task.filename = crate::model::sanitize_filename(&picked.name);
@@ -1705,9 +1704,7 @@ mod tests {
         assert!(is_google_drive_url(
             "https://drive.usercontent.google.com/download?id=abc"
         ));
-        assert!(is_google_drive_url(
-            "https://lh3.googleusercontent.com/abc"
-        ));
+        assert!(is_google_drive_url("https://lh3.googleusercontent.com/abc"));
         assert!(!is_google_drive_url("https://example.com/file.zip"));
         assert!(!is_google_drive_url(
             "https://notdrive.google.com.evil.com/file.zip"
@@ -1751,7 +1748,10 @@ mod tests {
     #[test]
     fn prefixed_no_double_prefix() {
         assert_eq!(
-            prefixed("Real-Debrid", "Real-Debrid: hoster_unsupported (error 16, HTTP 400)"),
+            prefixed(
+                "Real-Debrid",
+                "Real-Debrid: hoster_unsupported (error 16, HTTP 400)"
+            ),
             "Real-Debrid: hoster_unsupported (error 16, HTTP 400)"
         );
         assert_eq!(

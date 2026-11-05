@@ -51,6 +51,7 @@ type YtProbeSlot =
 #[derive(Default)]
 struct PrewarmState {
     url: String,
+    egress: String,
     loading: bool,
     text: String,
     total: Option<u64>,
@@ -88,20 +89,26 @@ fn spawn_prewarm(
     task: &DownloadTask,
     conns: u32,
     global_proxy: &str,
+    global_dns: &str,
 ) {
     let url = task.url.trim().to_string();
-    if url.is_empty() || st.url == url {
+    let proxy = crate::model::effective_proxy(&task.proxy_url, global_proxy);
+    let dns = crate::model::effective_dns_provider(&task.dns_provider, global_dns);
+    let egress = format!("{proxy}\n{dns}");
+    if url.is_empty() || (st.url == url && st.egress == egress) {
         return;
     }
+    *st = PrewarmState::default();
     st.url = url.clone();
+    st.egress = egress;
     st.loading = true;
     st.text = "Probing…".into();
     let mut probe_task = task.clone();
     probe_task.url = url.clone();
     // Probe same egress as eventual download (task override else global).
-    probe_task.proxy_url =
-        crate::model::effective_proxy(&probe_task.proxy_url, global_proxy).to_string();
-    let client = engine::build_client(&probe_task.proxy_url);
+    probe_task.proxy_url = proxy.to_string();
+    probe_task.dns_provider = dns.to_string();
+    let client = engine::build_client_with_dns(&probe_task.proxy_url, &probe_task.dns_provider);
     let slot = prewarm_ui_slot();
     rt.spawn(async move {
         match engine::prewarm(&client, &probe_task).await {
@@ -274,6 +281,7 @@ struct PendingDebridAdd {
     queue_id: String,
     start_now: bool,
     proxy_url: String,
+    dns_provider: String,
     debrid_choice: String,
 }
 
@@ -291,6 +299,7 @@ struct PendingMegaAdd {
     queue_id: String,
     start_now: bool,
     proxy_url: String,
+    dns_provider: String,
     debrid_choice: String,
 }
 
@@ -307,6 +316,7 @@ struct PendingTransferAdd {
     queue_id: String,
     start_now: bool,
     proxy_url: String,
+    dns_provider: String,
 }
 
 type TransferAddSlot = std::sync::Arc<
@@ -694,6 +704,7 @@ pub struct DownloadApp {
     add_headers: Vec<(String, String)>,
     add_mirrors: String,
     add_proxy: String,
+    add_dns_provider: String,
     add_desc: String,
     add_queue: String,
     add_start_now: bool,
@@ -1078,6 +1089,7 @@ impl DownloadApp {
             add_headers: Vec::new(),
             add_mirrors: String::new(),
             add_proxy: String::new(),
+            add_dns_provider: String::new(),
             add_desc: String::new(),
             add_queue: "main".into(),
             add_start_now: true,
@@ -1406,6 +1418,7 @@ impl DownloadApp {
                 );
                 if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
                     t.debrid_choice = pending.debrid_choice.clone();
+                    t.dns_provider = pending.dns_provider.clone();
                     g.save();
                 }
                 ids.push(id);
@@ -1436,6 +1449,7 @@ impl DownloadApp {
                         referrer: pending.referrer.clone(),
                         cookies: pending.cookies.clone(),
                         proxy_url: pending.proxy_url.clone(),
+                        dns_provider: pending.dns_provider.clone(),
                         ..Default::default()
                     };
                     ids.push(task.id.clone());
@@ -1495,6 +1509,7 @@ impl DownloadApp {
                     // transfer.it is direct-only (no debrid provider
                     // supports it): force local regardless of picker.
                     t.debrid_choice = "none".to_string();
+                    t.dns_provider = pending.dns_provider.clone();
                     g.save();
                 }
                 ids.push(id);
@@ -1526,6 +1541,7 @@ impl DownloadApp {
                         referrer: pending.referrer.clone(),
                         cookies: pending.cookies.clone(),
                         proxy_url: pending.proxy_url.clone(),
+                        dns_provider: pending.dns_provider.clone(),
                         ..Default::default()
                     };
                     ids.push(task.id.clone());
@@ -1577,6 +1593,7 @@ impl DownloadApp {
                 );
                 if let Some(t) = g.state.tasks.iter_mut().find(|t| t.id == id) {
                     t.debrid_choice = pending.debrid_choice.clone();
+                    t.dns_provider = pending.dns_provider.clone();
                     g.save();
                 }
                 ids.push(id);
@@ -1607,6 +1624,7 @@ impl DownloadApp {
                         referrer: pending.referrer.clone(),
                         cookies: pending.cookies.clone(),
                         proxy_url: pending.proxy_url.clone(),
+                        dns_provider: pending.dns_provider.clone(),
                         ..Default::default()
                     };
                     ids.push(task.id.clone());
@@ -1797,8 +1815,7 @@ impl DownloadApp {
                 .with_url(&task.url)
                 .with_bytes(task.downloaded, task.total.unwrap_or(0)),
         );
-        crate::lock_unpoison(&self.rt)
-            .log(format!("Started {}: {}", task.filename, task.url));
+        crate::lock_unpoison(&self.rt).log(format!("Started {}: {}", task.filename, task.url));
         // ponytail: duration from created_at is wall-clock incl. pause time;
         // add started_at field when per-session duration matters.
         let started_ms = dl_history::now_ms();
@@ -1823,7 +1840,10 @@ impl DownloadApp {
             crate::model::effective_proxy(&task.proxy_url, &settings.proxy_url).to_string();
         let mut task = task;
         task.proxy_url = eff_proxy.clone();
-        let client = engine::build_client(&eff_proxy);
+        let eff_dns =
+            crate::model::effective_dns_provider(&task.dns_provider, &settings.dns_provider);
+        task.dns_provider = eff_dns.to_string();
+        let client = engine::build_client_with_dns(&eff_proxy, eff_dns);
         let ctrl2 = ctrl.clone();
         let handle = self.tokio_rt.spawn(async move {
             // Inner spawn: downloader panic (e.g. librqbit internals) surfaces as
@@ -1852,6 +1872,7 @@ impl DownloadApp {
                         // done carries effective proxy; keep stored override-only value.
                         let mut done = done;
                         done.proxy_url = t.proxy_url.clone();
+                        done.dns_provider = t.dns_provider.clone();
                         *t = done;
                     }
                     g.log(format!("Finished {fname}: {:?} {err}", status));
@@ -3632,7 +3653,23 @@ impl DownloadApp {
                         );
                     }
                     if let Some((
-                        _, _, _, _, _, _, _, _, aid, _, _, _, _, sid, tracks, chapters, chapter,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        aid,
+                        _,
+                        _,
+                        _,
+                        _,
+                        sid,
+                        tracks,
+                        chapters,
+                        chapter,
                     )) = &snap
                     {
                         // Tracks + subtitle style row.
@@ -3711,8 +3748,7 @@ impl DownloadApp {
                                             }
                                         }
                                     });
-                                let has_next =
-                                    cur_c + 1 < chapters.len() as i64;
+                                let has_next = cur_c + 1 < chapters.len() as i64;
                                 if ui
                                     .add_enabled(has_next, egui::Button::new("Next"))
                                     .clicked()
@@ -5711,7 +5747,10 @@ fn button_preset_preview(ui: &mut egui::Ui, p: &crate::model::ButtonPreset) {
     let radius = if p.radius == "50%" {
         w.min(h) / 2.0
     } else {
-        p.radius.trim_end_matches("px").parse::<f32>().unwrap_or(0.0)
+        p.radius
+            .trim_end_matches("px")
+            .parse::<f32>()
+            .unwrap_or(0.0)
     };
     painter.rect_filled(rect, radius, egui::Color32::from_rgb(46, 74, 69));
     painter.rect_stroke(
@@ -7365,6 +7404,26 @@ impl DownloadApp {
                         }
                     });
                 ui.end_row();
+                ui::form_label(ui, "DNS");
+                let global_dns = crate::lock_unpoison(&app.rt).state.settings.dns_provider.clone();
+                egui::ComboBox::from_id_salt("cap-dns")
+                    .selected_text(match t.dns_provider.as_str() {
+                        "system" => "System",
+                        "google" => "Google DoH",
+                        "cloudflare" => "Cloudflare DoH",
+                        _ => match global_dns.as_str() {
+                            "google" => "Global: Google DoH",
+                            "cloudflare" => "Global: Cloudflare DoH",
+                            _ => "Global: System",
+                        },
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut t.dns_provider, String::new(), "Global default");
+                        ui.selectable_value(&mut t.dns_provider, "system".into(), "System");
+                        ui.selectable_value(&mut t.dns_provider, "google".into(), "Google DoH");
+                        ui.selectable_value(&mut t.dns_provider, "cloudflare".into(), "Cloudflare DoH");
+                    });
+                ui.end_row();
                 ui::form_label(ui, "Proxy");
                 ui.vertical(|ui| {
                     let saved = crate::lock_unpoison(&app.rt).state.settings.proxies.clone();
@@ -7430,7 +7489,19 @@ impl DownloadApp {
                     .settings
                     .proxy_url
                     .clone();
-                spawn_prewarm(&mut app.prewarm_cap, &rt, &t, conns, &global_proxy);
+                let global_dns = crate::lock_unpoison(&app.rt)
+                    .state
+                    .settings
+                    .dns_provider
+                    .clone();
+                spawn_prewarm(
+                    &mut app.prewarm_cap,
+                    &rt,
+                    &t,
+                    conns,
+                    &global_proxy,
+                    &global_dns,
+                );
                 if !app.prewarm_cap.text.is_empty() {
                     ui.label(
                         egui::RichText::new(&app.prewarm_cap.text)
@@ -7591,7 +7662,11 @@ impl DownloadApp {
                     egui::CollapsingHeader::new(format!(
                         "Headers ({}{})",
                         wire.len(),
-                        if t.cookies.is_empty() { "" } else { " + cookies" }
+                        if t.cookies.is_empty() {
+                            ""
+                        } else {
+                            " + cookies"
+                        }
                     ))
                     .id_salt("cap-headers")
                     .show(ui, |ui| {
@@ -8325,7 +8400,10 @@ impl DownloadApp {
                             .map(|(n, v)| (n.to_ascii_lowercase(), v))
                             .collect();
                         let rt = app.tokio_rt.clone();
-                        let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
+                        let global_proxy = {
+                            let g = crate::lock_unpoison(&app.rt);
+                            g.state.settings.proxy_url.clone()
+                        };
                         let eff_proxy = crate::model::effective_proxy(&app.add_proxy, &global_proxy).to_string();
                         ui_yt_probe_section(ui, &mut app.yt_probe_add, "add", &u, &r, &c, &cj, &hdrs, &rt, &eff_proxy);
                     } else if !app.add_url.trim().is_empty() {
@@ -8338,6 +8416,7 @@ impl DownloadApp {
                             username: app.add_user.clone(),
                             password: app.add_pass.clone(),
                             proxy_url: app.add_proxy.clone(),
+                            dns_provider: app.add_dns_provider.clone(),
                             ..Default::default()
                         };
                         // Changed URL since last frame: stale prewarm dropped.
@@ -8349,8 +8428,11 @@ impl DownloadApp {
                             prewarm_poll(&mut app.prewarm_add, &t.url);
                             let rt = app.tokio_rt.clone();
                             let conns = crate::lock_unpoison(&app.rt).state.settings.max_connections;
-                            let global_proxy = crate::lock_unpoison(&app.rt).state.settings.proxy_url.clone();
-                            spawn_prewarm(&mut app.prewarm_add, &rt, &t, conns, &global_proxy);
+                            let (global_proxy, global_dns) = {
+                                let g = crate::lock_unpoison(&app.rt);
+                                (g.state.settings.proxy_url.clone(), g.state.settings.dns_provider.clone())
+                            };
+                            spawn_prewarm(&mut app.prewarm_add, &rt, &t, conns, &global_proxy, &global_dns);
                             if !app.prewarm_add.text.is_empty() {
                                 ui.label(egui::RichText::new(&app.prewarm_add.text).small().color(theme::TEXT_MUTED));
                             } else if app.prewarm_add.loading {
@@ -8404,6 +8486,26 @@ impl DownloadApp {
                             )
                             .on_hover_text("Per-download proxy. Used for probing (incl. yt-dlp) and downloading this URL. HTTP/HLS/DASH/yt-dlp; FTP/SFTP/NNTP/torrent swarm stay direct.");
                         });
+                        ui.end_row();
+                        ui::form_label(ui, "DNS");
+                        let global_dns = crate::lock_unpoison(&app.rt).state.settings.dns_provider.clone();
+                        egui::ComboBox::from_id_salt("add-dns")
+                            .selected_text(match app.add_dns_provider.as_str() {
+                                "system" => "System",
+                                "google" => "Google DoH",
+                                "cloudflare" => "Cloudflare DoH",
+                                _ => match global_dns.as_str() {
+                                    "google" => "Global: Google DoH",
+                                    "cloudflare" => "Global: Cloudflare DoH",
+                                    _ => "Global: System",
+                                },
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut app.add_dns_provider, String::new(), "Global default");
+                                ui.selectable_value(&mut app.add_dns_provider, "system".into(), "System");
+                                ui.selectable_value(&mut app.add_dns_provider, "google".into(), "Google DoH");
+                                ui.selectable_value(&mut app.add_dns_provider, "cloudflare".into(), "Cloudflare DoH");
+                            });
                         ui.end_row();
                         ui::form_label(ui, "Description");
                         ui.add(fill_edit(&mut app.add_desc));
@@ -8571,15 +8673,18 @@ impl DownloadApp {
                 if downloadcraft_lib::transferit::is_transfer_url(&url)
                     && self.pending_transfer_add.is_none()
                 {
-                    let (_settings, proxy) = {
+                    let (proxy, dns) = {
                         let g = crate::lock_unpoison(&self.rt);
                         (
-                            g.state.settings.clone(),
                             crate::model::effective_proxy(
                                 &proxy_override,
                                 &g.state.settings.proxy_url,
                             )
                             .to_string(),
+                            crate::model::effective_dns_provider(
+                                &self.add_dns_provider,
+                                &g.state.settings.dns_provider,
+                            ),
                         )
                     };
                     if let Ok(mut s) = self.transfer_add_slot.try_lock() {
@@ -8592,13 +8697,14 @@ impl DownloadApp {
                         queue_id: queue.clone(),
                         start_now,
                         proxy_url: proxy_override.clone(),
+                        dns_provider: self.add_dns_provider.clone(),
                     });
                     let slot = self.transfer_add_slot.clone();
                     let rt2 = self.tokio_rt.clone();
                     let ctx2 = ctx.clone();
                     let url_clone = url.clone();
                     std::thread::spawn(move || {
-                        let client = engine::build_client(&proxy);
+                        let client = engine::build_client_with_dns(&proxy, dns);
                         let res = rt2
                             .block_on(downloadcraft_lib::transferit::list_transfer(
                                 client, &url_clone,
@@ -8619,15 +8725,18 @@ impl DownloadApp {
                 // via debrid at download start like other hoster links.
                 // Runs regardless of debrid_choice (even "none").
                 if crate::mega::is_mega_folder_url(&url) && self.pending_mega_add.is_none() {
-                    let (_settings, proxy) = {
+                    let (proxy, dns) = {
                         let g = crate::lock_unpoison(&self.rt);
                         (
-                            g.state.settings.clone(),
                             crate::model::effective_proxy(
                                 &proxy_override,
                                 &g.state.settings.proxy_url,
                             )
                             .to_string(),
+                            crate::model::effective_dns_provider(
+                                &self.add_dns_provider,
+                                &g.state.settings.dns_provider,
+                            ),
                         )
                     };
                     if let Ok(mut s) = self.mega_add_slot.try_lock() {
@@ -8640,6 +8749,7 @@ impl DownloadApp {
                         queue_id: queue.clone(),
                         start_now,
                         proxy_url: proxy_override.clone(),
+                        dns_provider: self.add_dns_provider.clone(),
                         debrid_choice: dchoice.clone(),
                     });
                     let slot = self.mega_add_slot.clone();
@@ -8647,7 +8757,7 @@ impl DownloadApp {
                     let ctx2 = ctx.clone();
                     let url_clone = url.clone();
                     std::thread::spawn(move || {
-                        let client = engine::build_client(&proxy);
+                        let client = engine::build_client_with_dns(&proxy, dns);
                         let res = rt2
                             .block_on(crate::mega::list_folder(client, &url_clone))
                             .map(|f| f.files);
@@ -8664,7 +8774,7 @@ impl DownloadApp {
                 // creates one task per file. Picker selection ignored here
                 // (provider file names != librqbit indices).
                 if crate::debrid::is_magnet(&url) && self.pending_debrid_add.is_none() {
-                    let (settings, proxy) = {
+                    let (settings, proxy, dns) = {
                         let g = crate::lock_unpoison(&self.rt);
                         (
                             g.state.settings.clone(),
@@ -8673,6 +8783,10 @@ impl DownloadApp {
                                 &g.state.settings.proxy_url,
                             )
                             .to_string(),
+                            crate::model::effective_dns_provider(
+                                &self.add_dns_provider,
+                                &g.state.settings.dns_provider,
+                            ),
                         )
                     };
                     if crate::debrid::any_for_magnets_choice(&settings, &dchoice) {
@@ -8686,6 +8800,7 @@ impl DownloadApp {
                             queue_id: queue.clone(),
                             start_now,
                             proxy_url: proxy_override.clone(),
+                            dns_provider: self.add_dns_provider.clone(),
                             debrid_choice: dchoice.clone(),
                         });
                         let slot = self.debrid_add_slot.clone();
@@ -8693,7 +8808,7 @@ impl DownloadApp {
                         let ctx2 = ctx.clone();
                         let magnet = url.clone();
                         std::thread::spawn(move || {
-                            let client = engine::build_client(&proxy);
+                            let client = engine::build_client_with_dns(&proxy, dns);
                             let res = rt2
                                 .block_on(crate::debrid::resolve_magnet_choice(
                                     client, &settings, &magnet, &dchoice,
@@ -8753,6 +8868,7 @@ impl DownloadApp {
                         t.mirrors = mirrors;
                         t.description = desc;
                         t.proxy_url = proxy_override;
+                        t.dns_provider = self.add_dns_provider.clone();
                         // Torrent picker: empty vec = all files; validate vs probe.
                         // Only for torrent tasks; stale picker state must not leak.
                         if crate::torrent::is_torrent_task(t) && !self.add_torrent_files.is_empty()
@@ -8856,6 +8972,7 @@ impl DownloadApp {
                 self.add_headers.clear();
                 self.add_mirrors.clear();
                 self.add_proxy.clear();
+                self.add_dns_provider.clear();
                 self.add_desc.clear();
                 self.yt_probe_add = YtProbeState::default();
                 // Cancel: drop prewarm entry (abandoned cost = 1 range request).
@@ -10533,8 +10650,7 @@ impl DownloadApp {
     }
 
     fn chat_push(&mut self, text: String) {
-        self.chat_ts
-            .push(downloadcraft_lib::chat_history::now_ms());
+        self.chat_ts.push(downloadcraft_lib::chat_history::now_ms());
         self.chat_messages
             .push(downloadcraft_lib::chat_core::ChatMsg { user: false, text });
         self.chat_persist();
@@ -10580,25 +10696,15 @@ impl DownloadApp {
         self
     }
 
-    fn chat_audit(
-        &self,
-        kind: &str,
-        action: &str,
-        outcome: &str,
-        detail: &str,
-        latency_ms: u64,
-    ) {
+    fn chat_audit(&self, kind: &str, action: &str, outcome: &str, detail: &str, latency_ms: u64) {
         let model = crate::lock_unpoison(&self.rt)
             .state
             .settings
             .chatbot_model
             .clone();
         downloadcraft_lib::chat_audit::append_default(
-            &downloadcraft_lib::chat_audit::AuditEvent::new(
-                self.chat_session_id.clone(),
-                kind,
-            )
-            .with(action, outcome, detail, &model, latency_ms),
+            &downloadcraft_lib::chat_audit::AuditEvent::new(self.chat_session_id.clone(), kind)
+                .with(action, outcome, detail, &model, latency_ms),
         );
     }
 
@@ -10792,11 +10898,8 @@ impl DownloadApp {
                 st90.completions,
                 fmt_bytes(st90.total_bytes)
             ));
-            let mut recent = dl_history::load_completions(
-                &dir,
-                now.saturating_sub(30 * 86_400_000),
-                now,
-            );
+            let mut recent =
+                dl_history::load_completions(&dir, now.saturating_sub(30 * 86_400_000), now);
             recent.reverse();
             recent.truncate(15);
             if !recent.is_empty() {
@@ -10811,12 +10914,8 @@ impl DownloadApp {
                     ));
                 }
             }
-            let today_speed = dl_history::load_speed_series(
-                &dir,
-                now.saturating_sub(86_400_000),
-                now,
-                300_000,
-            );
+            let today_speed =
+                dl_history::load_speed_series(&dir, now.saturating_sub(86_400_000), now, 300_000);
             if let Some(peak) = today_speed
                 .iter()
                 .map(|p| p.bps)
@@ -10898,8 +10997,7 @@ impl DownloadApp {
                             ));
                         }
                         if !handled_readonly {
-                            self.chat_ts
-                                .push(downloadcraft_lib::chat_history::now_ms());
+                            self.chat_ts.push(downloadcraft_lib::chat_history::now_ms());
                             self.chat_messages
                                 .push(downloadcraft_lib::chat_core::ChatMsg {
                                     user: false,
@@ -10945,8 +11043,7 @@ impl DownloadApp {
             return;
         }
         self.chat_input.clear();
-        self.chat_ts
-            .push(downloadcraft_lib::chat_history::now_ms());
+        self.chat_ts.push(downloadcraft_lib::chat_history::now_ms());
         self.chat_messages
             .push(downloadcraft_lib::chat_core::ChatMsg {
                 user: true,
@@ -11009,16 +11106,13 @@ impl DownloadApp {
                 m.user && downloadcraft_lib::chat_core::wants_local_context(&m.text)
             });
         // PT/ES + named place (Xique-Xique) via chat_context; EN fallback below.
-        let place = downloadcraft_lib::chat_context::extract_named_place(&text)
-            .or_else(|| {
-                self.chat_messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.user)
-                    .and_then(|m| {
-                        downloadcraft_lib::chat_context::extract_named_place(&m.text)
-                    })
-            });
+        let place = downloadcraft_lib::chat_context::extract_named_place(&text).or_else(|| {
+            self.chat_messages
+                .iter()
+                .rev()
+                .find(|m| m.user)
+                .and_then(|m| downloadcraft_lib::chat_context::extract_named_place(&m.text))
+        });
         let ml_need = downloadcraft_lib::chat_context::local_need(&text).map(|n| {
             downloadcraft_lib::chat_core::LocalNeed {
                 weather: n.weather,
@@ -11253,6 +11347,14 @@ impl DownloadApp {
                         },
                         "download_dir" => s.download_dir = std::path::PathBuf::from(&val_t),
                         "proxy_url" => s.proxy_url = val_t.clone(),
+                        "dns_provider" => match val_t.as_str() {
+                            "system" | "google" | "cloudflare" => s.dns_provider = val_t.clone(),
+                            _ => {
+                                err = Some(
+                                    "dns_provider must be system, google, or cloudflare".into(),
+                                )
+                            }
+                        },
                         _ => err = Some(format!("setting '{key_t}' not allowed")),
                     }
                 }
@@ -11422,8 +11524,10 @@ impl DownloadApp {
             series.into_iter().filter(|p| p.ts_ms >= cutoff).collect();
         if series.len() < 2 {
             ui.label(
-                egui::RichText::new("No speed samples yet (recorded every ~5 s while downloading).")
-                    .color(theme::TEXT_FAINT),
+                egui::RichText::new(
+                    "No speed samples yet (recorded every ~5 s while downloading).",
+                )
+                .color(theme::TEXT_FAINT),
             );
         } else {
             let max_bps = series.iter().map(|p| p.bps).fold(1.0f64, f64::max);
@@ -11516,9 +11620,7 @@ impl DownloadApp {
         let mut recent: Vec<&dl_history::DlEvent> = self
             .hist_events
             .iter()
-            .filter(|e| {
-                e.kind == dl_history::KIND_COMPLETED || e.kind == dl_history::KIND_FAILED
-            })
+            .filter(|e| e.kind == dl_history::KIND_COMPLETED || e.kind == dl_history::KIND_FAILED)
             .collect();
         recent.reverse();
         recent.truncate(40);
@@ -11543,7 +11645,11 @@ impl DownloadApp {
                         .checked_div(e.duration_ms)
                         .map(|v| format!(" · avg {}/s", fmt_bytes(v)))
                         .unwrap_or_default();
-                    let mark = if e.kind == dl_history::KIND_COMPLETED { "✓" } else { "✗" };
+                    let mark = if e.kind == dl_history::KIND_COMPLETED {
+                        "✓"
+                    } else {
+                        "✗"
+                    };
                     ui.label(format!(
                         "{mark} {} · {} · {}{} · {}",
                         when,
@@ -11812,18 +11918,19 @@ impl DownloadApp {
                     .desired_width(220.0),
             );
             if ui::Btn::secondary("Search").show(ui).clicked() {
-                self.chat_search_hits = downloadcraft_lib::chat_history::search(
-                    &self.chat_sessions,
-                    &self.chat_search,
-                )
-                .into_iter()
-                .map(|(id, i, sn)| (id.to_string(), i, sn))
-                .collect();
+                self.chat_search_hits =
+                    downloadcraft_lib::chat_history::search(&self.chat_sessions, &self.chat_search)
+                        .into_iter()
+                        .map(|(id, i, sn)| (id.to_string(), i, sn))
+                        .collect();
             }
         });
         for (sid, _idx, snippet) in self.chat_search_hits.clone() {
             if ui
-                .small_button(format!("> {}", snippet.chars().take(72).collect::<String>()))
+                .small_button(format!(
+                    "> {}",
+                    snippet.chars().take(72).collect::<String>()
+                ))
                 .clicked()
             {
                 self.chat_apply_session(&sid);
@@ -12655,7 +12762,11 @@ impl DownloadApp {
                 ui.selectable_value(&mut self.log_filter, val.to_string(), label);
             }
             ui.checkbox(&mut self.log_autoscroll, "Auto-scroll");
-            if ui::Btn::secondary("Clear").icon(Icon::Delete).show(ui).clicked() {
+            if ui::Btn::secondary("Clear")
+                .icon(Icon::Delete)
+                .show(ui)
+                .clicked()
+            {
                 downloadcraft_lib::applog::clear();
             }
         });
@@ -12907,6 +13018,24 @@ impl DownloadApp {
                     ui.label(egui::RichText::new("Applies on restart. Speed limit above also caps torrent upload + download.").color(theme::TEXT_FAINT).small());
                 }
                 5 => {
+                    section(ui, "DNS over HTTPS");
+                    ui::form_grid("opts-dns-grid").show(ui, |ui| {
+                        ui::form_label(ui, "Resolver");
+                        egui::ComboBox::from_id_salt("opts-dns")
+                            .selected_text(match settings.dns_provider.as_str() {
+                                "google" => "Google DoH",
+                                "cloudflare" => "Cloudflare DoH",
+                                _ => "System DNS",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.dns_provider, "system".into(), "System DNS");
+                                ui.selectable_value(&mut settings.dns_provider, "google".into(), "Google DoH");
+                                ui.selectable_value(&mut settings.dns_provider, "cloudflare".into(), "Cloudflare DoH");
+                            });
+                        ui.end_row();
+                    });
+                    ui.label(egui::RichText::new("Applies to direct HTTP(S) requests only. Proxy DNS stays with the proxy; yt-dlp, torrent, FTP and SFTP are unchanged. The OS DNS configuration is not modified.").color(theme::TEXT_FAINT).small());
+                    ui.add_space(theme::SP_MD);
                     section(ui, "Proxy / SOCKS");
                     ui::form_grid("opts-proxy-grid").show(ui, |ui| {
                         ui::form_label(ui, "Proxy");
@@ -14129,10 +14258,9 @@ mod header_row_tests {
         ])
         .is_none());
         // Case-insensitive duplicates rejected.
-        assert!(header_rows_error(&[
-            ("Accept".into(), "a".into()),
-            ("accept".into(), "b".into()),
-        ])
+        assert!(header_rows_error(
+            &[("Accept".into(), "a".into()), ("accept".into(), "b".into()),]
+        )
         .is_some());
         // Over-long name / value rejected.
         assert!(header_rows_error(&[("x".repeat(65), "v".into())]).is_some());

@@ -113,10 +113,7 @@ pub fn is_mega_folder_url(url: &str) -> bool {
 /// `None` when `url` is not a MEGA folder URL.
 pub fn folder_share_url(url: &str) -> Option<String> {
     let p = parse_url(url)?;
-    Some(format!(
-        "https://mega.nz/folder/{}#{}",
-        p.folder_id, p.key
-    ))
+    Some(format!("https://mega.nz/folder/{}#{}", p.folder_id, p.key))
 }
 
 fn b64_val(c: u8) -> Option<u32> {
@@ -164,7 +161,11 @@ fn b64e(data: &[u8]) -> String {
     const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(ALPH[(n >> 18) as usize & 63] as char);
         out.push(ALPH[(n >> 12) as usize & 63] as char);
@@ -300,15 +301,17 @@ fn decrypt_nodes(folder_id: &str, key_bytes: &[u8], nodes: &serde_json::Value) -
     .unwrap_or_else(|| "MEGA folder".to_string());
 
     let mut files = Vec::new();
-    for node in nodes.iter().filter(|n| n.get("t").and_then(|t| t.as_u64()) == Some(0)) {
+    for node in nodes
+        .iter()
+        .filter(|n| n.get("t").and_then(|t| t.as_u64()) == Some(0))
+    {
         let Some(handle) = node.get("h").and_then(|h| h.as_str()) else {
             continue;
         };
         let Some(k) = node.get("k").and_then(|k| k.as_str()) else {
             continue;
         };
-        let Some(raw) = pick_key_entry(k, &root_h).and_then(|enc| dec_key(&enc, key_bytes))
-        else {
+        let Some(raw) = pick_key_entry(k, &root_h).and_then(|enc| dec_key(&enc, key_bytes)) else {
             continue;
         };
         let attr_key: Vec<u8> = match raw.len() {
@@ -330,10 +333,7 @@ fn decrypt_nodes(folder_id: &str, key_bytes: &[u8], nodes: &serde_json::Value) -
             // folder context (`?n=<folderId>`). The fragment key is the
             // folder key, which decrypts every child node — `decrypt_nodes`
             // regenerates this form for any selected handle.
-            link: format!(
-                "https://mega.nz/folder/{}/file/{}",
-                folder_id, handle
-            ),
+            link: format!("https://mega.nz/folder/{}/file/{}", folder_id, handle),
             handle: handle.to_string(),
             key: match raw.len() {
                 32 => raw.clone(),
@@ -369,7 +369,11 @@ pub fn b64e_nopad(data: &[u8]) -> String {
     const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(ALPH[(n >> 18) as usize & 63] as char);
         out.push(ALPH[(n >> 12) as usize & 63] as char);
@@ -742,10 +746,7 @@ mod tests {
             .unwrap();
         assert_eq!(f1.name, "0272.part09.rar");
         assert_eq!(f1.size, Some(754318168));
-        assert_eq!(
-            f1.link,
-            "https://mega.nz/folder/WRMSVYAS/file/3d1kHLiT"
-        );
+        assert_eq!(f1.link, "https://mega.nz/folder/WRMSVYAS/file/3d1kHLiT");
         // The folder-selection link carries no fragment key; re-listing it
         // with the folder key narrows to exactly this file.
         assert!(is_mega_folder_url(
@@ -788,10 +789,7 @@ mod tests {
     #[test]
     fn folder_share_url_forms() {
         let canonical = "https://mega.nz/folder/WRMSVYAS#FIBCO0O4W6plbvVKNOc4cQ";
-        assert_eq!(
-            folder_share_url(canonical).as_deref(),
-            Some(canonical)
-        );
+        assert_eq!(folder_share_url(canonical).as_deref(), Some(canonical));
         // Per-file selection form loses the `/file/<handle>` part.
         assert_eq!(
             folder_share_url(
@@ -812,7 +810,9 @@ mod tests {
         );
         // Non-folder URLs rejected.
         assert_eq!(
-            folder_share_url("https://mega.nz/file/3d1kHLiT#U-BlUBWRxh-b7nQVNiujMxwB1Vc0hW23TzYpDQhioaw"),
+            folder_share_url(
+                "https://mega.nz/file/3d1kHLiT#U-BlUBWRxh-b7nQVNiujMxwB1Vc0hW23TzYpDQhioaw"
+            ),
             None
         );
         assert_eq!(folder_share_url("https://mega.nz/folder/WRMSVYAS"), None);
@@ -864,10 +864,8 @@ mod tests {
         assert_eq!(p.folder_id, "WRMSVYAS");
         assert_eq!(p.key, "FIBCO0O4W6plbvVKNOc4cQ");
         assert_eq!(p.selection, None);
-        let p = parse_url(
-            "https://mega.nz/folder/WRMSVYAS/file/3d1kHLiT#FIBCO0O4W6plbvVKNOc4cQ",
-        )
-        .unwrap();
+        let p = parse_url("https://mega.nz/folder/WRMSVYAS/file/3d1kHLiT#FIBCO0O4W6plbvVKNOc4cQ")
+            .unwrap();
         assert_eq!(p.selection.as_deref(), Some("3d1kHLiT"));
     }
 
@@ -879,8 +877,14 @@ mod tests {
         let a = "nPf9vTIxvG_BxIidKRSBwgEhtCafbDENrLntolCWQ-Bn1zC69xe4HLKehbgVtYBi8lH4nvFWYYuoHCy7oI0VrA";
         let k = b64d("TPEpgreX18iRLIZWiOVHVDGhY3bVtz2tlGn6Bhnz03w").unwrap();
         assert_eq!(k.len(), 32);
-        assert_eq!(decrypt_file_attrs(a, &k).as_deref(), Some("thunderbirds.iso"));
-        assert_eq!(b64e_nopad(&k), "TPEpgreX18iRLIZWiOVHVDGhY3bVtz2tlGn6Bhnz03w");
+        assert_eq!(
+            decrypt_file_attrs(a, &k).as_deref(),
+            Some("thunderbirds.iso")
+        );
+        assert_eq!(
+            b64e_nopad(&k),
+            "TPEpgreX18iRLIZWiOVHVDGhY3bVtz2tlGn6Bhnz03w"
+        );
         assert_eq!(decrypt_file_attrs(a, &k[..16]), None);
     }
 

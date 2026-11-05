@@ -151,10 +151,8 @@ async fn api_call(
         match parse_api_result(&text) {
             Ok(v) => return Ok(v),
             Err(e) if e == "MEGA API error -3" && attempt < 4 => {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    250 * u64::from(attempt),
-                ))
-                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                    .await;
             }
             Err(e) => return Err(e),
         }

@@ -173,9 +173,8 @@ fn file_size(path: &Path) -> u64 {
 // ------------------------------------------------------------- mem ring
 
 fn mem_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<LogRecord>> {
-    static RING: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::VecDeque<LogRecord>>,
-    > = std::sync::OnceLock::new();
+    static RING: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<LogRecord>>> =
+        std::sync::OnceLock::new();
     RING.get_or_init(|| {
         std::sync::Mutex::new(std::collections::VecDeque::with_capacity(MAX_MEM_ENTRIES))
     })
@@ -834,8 +833,14 @@ mod tests {
         let snap = snapshot();
         assert!(snap.len() <= MAX_MEM_ENTRIES);
         let newest = format!("m{}", MAX_MEM_ENTRIES + 4);
-        assert!(snap.iter().any(|r| r.msg == newest), "newest flood entry kept");
-        assert!(!snap.iter().any(|r| r.msg == "m0"), "oldest flood entry dropped");
+        assert!(
+            snap.iter().any(|r| r.msg == newest),
+            "newest flood entry kept"
+        );
+        assert!(
+            !snap.iter().any(|r| r.msg == "m0"),
+            "oldest flood entry dropped"
+        );
         clear();
         assert!(
             !snapshot().iter().any(|r| r.msg == newest),

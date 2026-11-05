@@ -492,7 +492,7 @@ pub async fn download_url_with_settings(
             client,
             task.clone(),
             ctrl,
-            engine::prewarm_take(&task.url),
+            engine::prewarm_take(&task),
             settings.max_part_mb * 1024 * 1024,
         )
         .await;
@@ -510,7 +510,7 @@ pub async fn download_url_with_settings(
                 client,
                 task.clone(),
                 ctrl,
-                engine::prewarm_take(&task.url),
+                engine::prewarm_take(&task),
                 settings.max_part_mb * 1024 * 1024,
             )
             .await
@@ -574,7 +574,7 @@ async fn download_metalink(
         client,
         task.clone(),
         ctrl,
-        engine::prewarm_take(&task.url),
+        engine::prewarm_take(&task),
         max_part,
     )
     .await

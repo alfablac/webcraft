@@ -941,17 +941,13 @@ impl DrivesUi {
                     // in ui(). Crypt/SFTP/FTP backends Err -> status.
                     if let Ok((_acc, be)) = Self::backend(&settings, &self.panes[i].account_id) {
                         {
-                            let slot: StreamSlot =
-                                Arc::new(Mutex::new(None));
+                            let slot: StreamSlot = Arc::new(Mutex::new(None));
                             let slot2 = slot.clone();
                             let name = entry.name.clone();
                             self.status = format!("Resolving stream for {name}...");
                             self.stream_slot = Some(slot);
                             tokio_rt.spawn(async move {
-                                let r = be
-                                    .stream_url(&entry)
-                                    .await
-                                    .map(|s| (s.url, s.headers));
+                                let r = be.stream_url(&entry).await.map(|s| (s.url, s.headers));
                                 *crate::lock_unpoison(&slot2) = Some(r);
                             });
                         }
@@ -1379,9 +1375,7 @@ impl DrivesUi {
                 // twice). Crypt accounts excluded (ids encrypted).
                 let gdrive_pair = [idx, 1 - idx].iter().all(|&i| {
                     account_by_id(settings, &self.panes[i].account_id)
-                        .map(|a| {
-                            a.kind == DriveKind::GoogleDrive && a.crypt_password.is_empty()
-                        })
+                        .map(|a| a.kind == DriveKind::GoogleDrive && a.crypt_password.is_empty())
                         .unwrap_or(false)
                 });
                 if gdrive_pair {

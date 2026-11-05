@@ -539,7 +539,10 @@ fn serve_throttled(body: Vec<u8>, limit: usize) -> String {
                     .find(|l| l.to_ascii_lowercase().starts_with("range:"))
                     .map(|l| l.to_string());
                 let Some(r) = range else {
-                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
                     let _ = s.write_all(resp.as_bytes());
                     let _ = s.write_all(&body);
                     return;
@@ -560,7 +563,9 @@ fn serve_throttled(body: Vec<u8>, limit: usize) -> String {
                 let _ = s.write_all(resp.as_bytes());
                 // Slow drip so concurrency actually overlaps.
                 for ch in slice.chunks(8192) {
-                    if s.write_all(ch).is_err() { break; }
+                    if s.write_all(ch).is_err() {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 live.fetch_sub(1, Ordering::SeqCst);

@@ -90,6 +90,9 @@ pub struct DownloadTask {
     /// Empty = inherit Settings::proxy_url. Plain in state.json like global.
     #[serde(default)]
     pub proxy_url: String,
+    /// Per-download DNS provider override: empty inherits Settings::dns_provider.
+    #[serde(default)]
+    pub dns_provider: String,
     /// Display-only debrid route info:
     /// `"<Provider> · <host> · <cached|cached: unknown|not cached>"`.
     /// Empty = not debrid.
@@ -137,6 +140,19 @@ pub fn effective_proxy<'a>(task_proxy: &'a str, global_proxy: &'a str) -> &'a st
         global_proxy
     } else {
         task_proxy
+    }
+}
+
+pub fn effective_dns_provider(task_dns: &str, global_dns: &str) -> &'static str {
+    let provider = if task_dns.trim().is_empty() {
+        global_dns
+    } else {
+        task_dns
+    };
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "google" => "google",
+        "cloudflare" => "cloudflare",
+        _ => "system",
     }
 }
 
@@ -263,16 +279,86 @@ pub struct ButtonPreset {
 /// The 10 video-button presets; "arrow-m" is the default (see `def_button_preset`).
 pub fn button_presets() -> &'static [ButtonPreset] {
     &[
-        ButtonPreset { id: "arrow-s", label: "Arrow · Small", icon: "arrow", w: 22, h: 22, radius: "50%" },
-        ButtonPreset { id: "arrow-m", label: "Arrow · Medium", icon: "arrow", w: 27, h: 27, radius: "50%" },
-        ButtonPreset { id: "arrow-l", label: "Arrow · Large", icon: "arrow", w: 36, h: 36, radius: "50%" },
-        ButtonPreset { id: "arrow-xl", label: "Arrow · Extra large", icon: "arrow", w: 44, h: 44, radius: "50%" },
-        ButtonPreset { id: "bold-m", label: "Bold arrow · Medium", icon: "arrow-bold", w: 27, h: 27, radius: "50%" },
-        ButtonPreset { id: "bold-l", label: "Bold arrow · Large", icon: "arrow-bold", w: 36, h: 36, radius: "10px" },
-        ButtonPreset { id: "chevron-m", label: "Chevron · Medium", icon: "chevron", w: 27, h: 27, radius: "50%" },
-        ButtonPreset { id: "dl-s", label: "DL badge · Small", icon: "dl", w: 30, h: 22, radius: "11px" },
-        ButtonPreset { id: "dl-m", label: "DL badge · Medium", icon: "dl", w: 38, h: 27, radius: "13px" },
-        ButtonPreset { id: "plus-m", label: "Plus · Medium", icon: "plus", w: 27, h: 27, radius: "10px" },
+        ButtonPreset {
+            id: "arrow-s",
+            label: "Arrow · Small",
+            icon: "arrow",
+            w: 22,
+            h: 22,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "arrow-m",
+            label: "Arrow · Medium",
+            icon: "arrow",
+            w: 27,
+            h: 27,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "arrow-l",
+            label: "Arrow · Large",
+            icon: "arrow",
+            w: 36,
+            h: 36,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "arrow-xl",
+            label: "Arrow · Extra large",
+            icon: "arrow",
+            w: 44,
+            h: 44,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "bold-m",
+            label: "Bold arrow · Medium",
+            icon: "arrow-bold",
+            w: 27,
+            h: 27,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "bold-l",
+            label: "Bold arrow · Large",
+            icon: "arrow-bold",
+            w: 36,
+            h: 36,
+            radius: "10px",
+        },
+        ButtonPreset {
+            id: "chevron-m",
+            label: "Chevron · Medium",
+            icon: "chevron",
+            w: 27,
+            h: 27,
+            radius: "50%",
+        },
+        ButtonPreset {
+            id: "dl-s",
+            label: "DL badge · Small",
+            icon: "dl",
+            w: 30,
+            h: 22,
+            radius: "11px",
+        },
+        ButtonPreset {
+            id: "dl-m",
+            label: "DL badge · Medium",
+            icon: "dl",
+            w: 38,
+            h: 27,
+            radius: "13px",
+        },
+        ButtonPreset {
+            id: "plus-m",
+            label: "Plus · Medium",
+            icon: "plus",
+            w: 27,
+            h: 27,
+            radius: "10px",
+        },
     ]
 }
 
@@ -351,9 +437,7 @@ pub fn divide_connections(total: u32, n: usize) -> Vec<u32> {
     let n32 = n as u32;
     let base = total / n32;
     let rem = total % n32;
-    (0..n)
-        .map(|i| base + u32::from((i as u32) < rem))
-        .collect()
+    (0..n).map(|i| base + u32::from((i as u32) < rem)).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -385,6 +469,9 @@ pub struct Settings {
     pub clipboard_monitor: bool,
     #[serde(default)]
     pub proxy_url: String,
+    /// DNS resolver used by direct HTTP(S) downloads: system, google, cloudflare.
+    #[serde(default = "def_dns_provider")]
+    pub dns_provider: String,
     /// Saved proxy list selectable per download (Add URL/File, browser
     /// capture). Migration safety: absent in old state files -> empty list;
     /// `proxy_url` above stays the global default, credentials stored
@@ -819,6 +906,9 @@ fn def_conn() -> u32 {
 fn def_global() -> usize {
     3
 }
+fn def_dns_provider() -> String {
+    "system".into()
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -833,6 +923,7 @@ impl Default for Settings {
             notifications: true,
             clipboard_monitor: false,
             proxy_url: String::new(),
+            dns_provider: def_dns_provider(),
             proxies: Vec::new(),
             scheduler_enabled: true,
             capture_exts: String::new(),
@@ -1410,6 +1501,13 @@ mod tests {
     }
 
     #[test]
+    fn effective_dns_provider_prefers_task_override() {
+        assert_eq!(effective_dns_provider("", "google"), "google");
+        assert_eq!(effective_dns_provider("cloudflare", "google"), "cloudflare");
+        assert_eq!(effective_dns_provider("unknown", "google"), "system");
+    }
+
+    #[test]
     fn table_layout_persists_and_defaults_when_absent() {
         let s = Settings {
             dl_sort_col: 5,
@@ -1526,8 +1624,7 @@ mod tests {
             pass: "p2".into(),
             enabled: true,
         });
-        let back: Settings =
-            serde_json::from_value(serde_json::to_value(&s2).unwrap()).unwrap();
+        let back: Settings = serde_json::from_value(serde_json::to_value(&s2).unwrap()).unwrap();
         assert_eq!(back, s2);
         assert_eq!(back.nntp_servers().len(), 2);
         // 20 over 2 enabled servers -> 10/10; disabled/blank extras excluded.

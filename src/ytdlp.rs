@@ -1485,8 +1485,7 @@ pub fn is_video_page(url: &str) -> bool {
             path.starts_with("/watch")
                 || path.starts_with("/shorts/")
                 || path.starts_with("/live/")
-                || ((seg(1) == "embed" || seg(1) == "v" || seg(1) == "clip")
-                    && !seg(2).is_empty())
+                || ((seg(1) == "embed" || seg(1) == "v" || seg(1) == "clip") && !seg(2).is_empty())
         }
         "youtube-nocookie.com" => {
             path.starts_with("/watch")
@@ -1500,8 +1499,7 @@ pub fn is_video_page(url: &str) -> bool {
                 || (seg(1) == "video" && is_digits(seg(2), 5))
                 || ((seg(1) == "channels" || seg(1) == "groups")
                     && !seg(2).is_empty()
-                    && (is_digits(seg(3), 5)
-                        || (seg(3) == "videos" && is_digits(seg(4), 5))))
+                    && (is_digits(seg(3), 5) || (seg(3) == "videos" && is_digits(seg(4), 5))))
         }
         "dailymotion.com" => {
             path.starts_with("/video/")
@@ -1527,9 +1525,7 @@ pub fn is_video_page(url: &str) -> bool {
                 || path.contains("/videos/")
                 || path.starts_with("/watch")
                 || path.starts_with("/reel/")
-                || (seg(1) == "share"
-                    && (seg(2) == "r" || seg(2) == "v")
-                    && !seg(3).is_empty())
+                || (seg(1) == "share" && (seg(2) == "r" || seg(2) == "v") && !seg(3).is_empty())
         }
         "threads.net" | "threads.com" => {
             seg(1).starts_with('@')
@@ -1584,9 +1580,7 @@ pub fn is_video_page(url: &str) -> bool {
     let pt_id_ok =
         |s: &str| s.len() >= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     (seg(1) == "w" && pt_id_ok(seg(2)))
-        || (seg(1) == "videos"
-            && (seg(2) == "watch" || seg(2) == "embed")
-            && pt_id_ok(seg(3)))
+        || (seg(1) == "videos" && (seg(2) == "watch" || seg(2) == "embed") && pt_id_ok(seg(3)))
 }
 
 #[cfg(test)]
@@ -2393,11 +2387,7 @@ mod tests {
             headers: h,
             ..Default::default()
         };
-        let a = base_args(
-            "https://x/watch",
-            &t,
-            Some(std::path::Path::new("jar.txt")),
-        );
+        let a = base_args("https://x/watch", &t, Some(std::path::Path::new("jar.txt")));
         assert!(a.iter().any(|x| x == "--cookies"), "args {a:?}");
         assert!(
             !a.iter()
@@ -2463,9 +2453,18 @@ mod tests {
             ..Default::default()
         };
         let a = base_args("https://example.com/v", &t, None);
-        for denied in ["Range:", "Accept-Encoding:", "Host:", "X-Rep-Id:", "X-Variant-Index:", "X-Nzb:"] {
+        for denied in [
+            "Range:",
+            "Accept-Encoding:",
+            "Host:",
+            "X-Rep-Id:",
+            "X-Variant-Index:",
+            "X-Nzb:",
+        ] {
             assert!(
-                !a.iter().any(|x| x.to_ascii_lowercase().starts_with(&denied.to_ascii_lowercase())),
+                !a.iter().any(|x| x
+                    .to_ascii_lowercase()
+                    .starts_with(&denied.to_ascii_lowercase())),
                 "{denied} leaked: {a:?}"
             );
         }

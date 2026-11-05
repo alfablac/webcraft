@@ -2,6 +2,15 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.27.0] - 2026-11-04
+
+### Added
+
+- Optional Google or Cloudflare DNS-over-HTTPS for direct HTTP downloads,
+  configured globally or per download. System DNS remains the default and OS
+  DNS settings are unchanged; proxied requests retain proxy DNS behavior, and
+  yt-dlp, torrent, FTP, and SFTP paths are unaffected.
+
 ## [0.26.0] - 2026-11-03
 
 ### Fixed

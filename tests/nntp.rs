@@ -340,7 +340,13 @@ async fn nntp_health_abort_stops_unusable_nzb_early() {
     // fetching all 200 (and without retrying any 430 — one BODY each).
     let fake = fake_nntp(vec![]);
     let segs: Vec<(&'static str, u64, u32)> = (0..200)
-        .map(|i| (Box::leak(format!("m{i}@news").into_boxed_str()) as &'static str, 100, i + 1))
+        .map(|i| {
+            (
+                Box::leak(format!("m{i}@news").into_boxed_str()) as &'static str,
+                100,
+                i + 1,
+            )
+        })
         .collect();
     let nzb = nzb_xml(&[(
         "poster &quot;gone.bin&quot;",

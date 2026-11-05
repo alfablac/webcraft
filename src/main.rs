@@ -128,7 +128,8 @@ impl Runtime {
                 t.cookies_json = cookies_json.to_string();
             }
             if !headers.is_empty() {
-                t.headers.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+                t.headers
+                    .extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             return t.id.clone();
         }
@@ -924,14 +925,7 @@ mod state_tests {
             );
         }
         // Empty incoming must not clear stored values.
-        let id3 = rt.add_url_full(
-            url,
-            "main",
-            "",
-            "",
-            "",
-            &std::collections::BTreeMap::new(),
-        );
+        let id3 = rt.add_url_full(url, "main", "", "", "", &std::collections::BTreeMap::new());
         assert_eq!(id1, id3);
         assert_eq!(rt.state.tasks.len(), 1);
         {

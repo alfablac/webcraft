@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.26.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.27.0-blue">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="Language" src="https://img.shields.io/badge/built%20with-Rust%20%2B%20egui-orange">
   <a href="https://addons.mozilla.org/en-US/firefox/addon/webcraft/"><img alt="Firefox Add-on" src="https://img.shields.io/badge/Firefox-Add--on%20on%20AMO-FF7139?logo=firefoxbrowser&logoColor=white"></a>
@@ -20,7 +20,7 @@
 
 webcraft reimplements the observable behavior of Internet Download Manager from scratch: segmented downloads that resume, queues and schedules, DASH/HLS handling, a site grabber, and deep browser integration. No IDM code, binaries, icons, or activation logic — and no affiliation with Tonec.
 
-**Current version:** 0.26.0 · Changelog lives in GitHub Releases.
+**Current version:** 0.27.0 · Changelog lives in GitHub Releases.
 
 **Runs on:** Windows 10/11 x86_64 · macOS 13+ (Intel and Apple Silicon) · Linux x86_64 (Ubuntu 22.04+, X11 and Wayland).
 
@@ -42,6 +42,7 @@ webcraft reimplements the observable behavior of Internet Download Manager from 
 - Pre-warm probing on add/capture: range probe, redirect resolution, and segment planning happen before you confirm; probe responses are reused instead of re-downloaded
 - Custom HTTP headers per download (User-Agent, Referer, Authorization Bearer, or any header) from the Add dialog's *Headers (advanced)* section — HTTP/S only
 - Per-download proxy override (Add URL/File *Transfer → Proxy*, browser Capture, or Progress dialog — Progress edits apply on restart); empty inherits the global Settings proxy. Applies to HTTP/HTTPS, HLS/DASH, Metalink, debrid, fetching NZB/.torrent files, and yt-dlp probe/download (`--proxy`); FTP/SFTP, NNTP articles, and torrent swarm stay direct. HTTP and SOCKS5 proxies work, with credentials in the URL
+- DNS-over-HTTPS (DoH) for direct HTTP downloads: choose System DNS, Google, or Cloudflare globally in Options, then override per download in Add, browser Capture, or Progress. This does not change OS DNS or affect proxy DNS, yt-dlp, torrents, FTP, or SFTP; proxied HTTP requests resolve through the proxy as usual
 - Mirrors per task with failover, per-task and global speed limits, SHA-256 verification, rename templates (`{name}`, `{ext}`, `{date}`, `{host}`, `{category}`), and category subfolders
 
 ### Protocols

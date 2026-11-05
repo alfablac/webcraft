@@ -586,7 +586,10 @@ pub fn parse_unrestrict_folder(json: &str) -> Result<Vec<RdFolderLink>, String> 
         }
         other => vec![other],
     };
-    let out: Vec<RdFolderLink> = items.iter().filter_map(|i| folder_link_from_value(i)).collect();
+    let out: Vec<RdFolderLink> = items
+        .iter()
+        .filter_map(|i| folder_link_from_value(i))
+        .collect();
     if out.is_empty() {
         return Err("Real-Debrid /unrestrict/folder returned no usable links".to_string());
     }

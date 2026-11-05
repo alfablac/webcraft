@@ -8,18 +8,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn build_client(proxy: &str) -> reqwest::Client {
-    let mut b = reqwest::Client::builder()
-        .user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .read_timeout(std::time::Duration::from_secs(60))
-        .pool_idle_timeout(std::time::Duration::from_secs(20))
-        .pool_max_idle_per_host(8);
-    if !proxy.trim().is_empty() {
-        if let Ok(p) = reqwest::Proxy::all(proxy.trim()) {
-            b = b.proxy(p);
-        }
-    }
-    b.build().unwrap_or_default()
+    build_client_with_dns(proxy, "system")
+}
+
+pub fn build_client_with_dns(proxy: &str, dns_provider: &str) -> reqwest::Client {
+    build_client_config(proxy, dns_provider, false)
 }
 
 /// Like [`build_client`] but with NO auto-redirect following and no
@@ -30,13 +23,38 @@ pub fn build_client(proxy: &str) -> reqwest::Client {
 /// cookies and lands on a sign-in page). Derived into a `no_redirect`
 /// client that shares the same proxy/egress by [`no_redirect_client`].
 pub fn build_client_no_redirect(proxy: &str) -> reqwest::Client {
+    build_client_no_redirect_with_dns(proxy, "system")
+}
+
+pub fn build_client_no_redirect_with_dns(proxy: &str, dns_provider: &str) -> reqwest::Client {
+    build_client_config(proxy, dns_provider, true)
+}
+
+fn build_client_config(proxy: &str, dns_provider: &str, no_redirect: bool) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("webcraft/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(60))
         .pool_idle_timeout(std::time::Duration::from_secs(20))
-        .pool_max_idle_per_host(8)
-        .redirect(reqwest::redirect::Policy::none());
+        .pool_max_idle_per_host(8);
+    if no_redirect {
+        b = b.redirect(reqwest::redirect::Policy::none());
+    }
+    if proxy.trim().is_empty() {
+        let config = match dns_provider {
+            "google" => Some(hickory_resolver::config::ResolverConfig::google_https()),
+            "cloudflare" => Some(hickory_resolver::config::ResolverConfig::cloudflare_https()),
+            _ => None,
+        };
+        if let Some(config) = config {
+            let resolver = hickory_resolver::TokioResolver::builder_with_config(
+                config,
+                hickory_resolver::name_server::TokioConnectionProvider::default(),
+            )
+            .build();
+            b = b.dns_resolver2(DoHResolver(resolver));
+        }
+    }
     if !proxy.trim().is_empty() {
         if let Ok(p) = reqwest::Proxy::all(proxy.trim()) {
             b = b.proxy(p);
@@ -45,8 +63,29 @@ pub fn build_client_no_redirect(proxy: &str) -> reqwest::Client {
     b.build().unwrap_or_default()
 }
 
+#[derive(Clone)]
+struct DoHResolver(hickory_resolver::TokioResolver);
+
+impl reqwest::dns::Resolve for DoHResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.0.clone();
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            let lookup = resolver.lookup_ip(name).await?;
+            let addrs: reqwest::dns::Addrs = Box::new(
+                lookup
+                    .iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, 0))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            Ok(addrs)
+        })
+    }
+}
+
 /// Manual redirects need a no-redirect twin that mirrors the caller's
-/// client exactly. [`build_client`] twins are cached per proxy; callers
+/// client exactly. [`build_client`] twins are cached per proxy and DNS provider; callers
 /// built with anything else will get an equivalent UA (same crate
 /// version) — acceptable: every app download/probe site builds via
 /// `build_client` with the task's effective proxy, so twins share egress
@@ -56,14 +95,16 @@ pub fn build_client_no_redirect(proxy: &str) -> reqwest::Client {
 /// engine free of client-pointer registries.
 fn no_redirect_client(task: &DownloadTask) -> reqwest::Client {
     static TWINS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+        std::sync::Mutex<std::collections::HashMap<(String, String), reqwest::Client>>,
     > = std::sync::OnceLock::new();
     let cache = TWINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(task.proxy_url.clone())
-        .or_insert_with(|| build_client_no_redirect(task.proxy_url.trim()))
+        .entry((task.proxy_url.clone(), task.dns_provider.clone()))
+        .or_insert_with(|| {
+            build_client_no_redirect_with_dns(task.proxy_url.trim(), &task.dns_provider)
+        })
         .clone()
 }
 
@@ -141,9 +182,7 @@ fn url_origin(url: &str) -> Option<(String, String, u16)> {
         return None;
     }
     let host = u.host_str()?.to_ascii_lowercase();
-    let port = u
-        .port()
-        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = u.port().unwrap_or(if scheme == "https" { 443 } else { 80 });
     Some((scheme, host, port))
 }
 
@@ -273,14 +312,22 @@ pub(crate) fn headers_for_target(
     // (applied above) win, rows apply only when the field is empty. This
     // covers pasted `Cookie: ...` headers that previously died silently.
     if cookie_ok && task.cookies.trim().is_empty() {
-        if let Some((_, v)) = task.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+        if let Some((_, v)) = task
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        {
             if let Ok(v) = v.trim().parse() {
                 h.insert(reqwest::header::COOKIE, v);
             }
         }
     }
     if task.referrer.trim().is_empty() {
-        if let Some((_, v)) = task.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("referer")) {
+        if let Some((_, v)) = task
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+        {
             if let Ok(v) = v.trim().parse() {
                 h.insert(reqwest::header::REFERER, v);
             }
@@ -341,7 +388,11 @@ pub const REDIRECT_HOP_LIMIT: u32 = 10;
 /// resolved final response of Drive URLs — Drive never serves HTML for a
 /// valid file download. Both sides must hold: Drive origin task + HTML
 /// final page.
-pub(crate) fn is_drive_signin_page(task_url: &str, final_url: &str, content_type: Option<&str>) -> bool {
+pub(crate) fn is_drive_signin_page(
+    task_url: &str,
+    final_url: &str,
+    content_type: Option<&str>,
+) -> bool {
     if !is_drive_url(task_url) {
         return false;
     }
@@ -1125,6 +1176,8 @@ pub struct Probe {
 #[derive(Clone)]
 pub struct CachedProbe {
     pub url: String,
+    pub proxy_url: String,
+    pub dns_provider: String,
     pub final_url: String,
     pub total: Option<u64>,
     pub accept_ranges: bool,
@@ -1173,13 +1226,17 @@ pub fn prewarm_drop(url: &str) {
         .unwrap_or_else(|e| e.into_inner())
         .remove(url.trim());
 }
-pub fn prewarm_take(url: &str) -> Option<CachedProbe> {
-    prewarm_take_at(url, std::time::Instant::now())
+pub fn prewarm_take(task: &DownloadTask) -> Option<CachedProbe> {
+    prewarm_take_at(task, std::time::Instant::now())
 }
-fn prewarm_take_at(url: &str, now: std::time::Instant) -> Option<CachedProbe> {
+fn prewarm_take_at(task: &DownloadTask, now: std::time::Instant) -> Option<CachedProbe> {
     let mut g = prewarm_registry().lock().unwrap_or_else(|e| e.into_inner());
-    let cache = g.remove(url.trim())?;
-    if cache.url == url.trim() && prewarm_fresh(cache.fetched_at, now) {
+    let cache = g.remove(task.url.trim())?;
+    if cache.url == task.url.trim()
+        && cache.proxy_url == task.proxy_url
+        && cache.dns_provider == task.dns_provider
+        && prewarm_fresh(cache.fetched_at, now)
+    {
         Some(cache)
     } else {
         None
@@ -1408,7 +1465,12 @@ pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<Ca
     let mut p = probe(client, task).await?;
     let _ = p.body.take();
     if let Some(ct) = p.content_type.as_deref() {
-        let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let ct = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if ct == "text/html"
             && (is_zip_family_name(&task.filename)
                 || is_zip_family_name(&p.final_url)
@@ -1419,6 +1481,8 @@ pub async fn prewarm(client: &reqwest::Client, task: &DownloadTask) -> Result<Ca
     }
     Ok(CachedProbe {
         url: task.url.clone(),
+        proxy_url: task.proxy_url.clone(),
+        dns_provider: task.dns_provider.clone(),
         final_url: p.final_url,
         total: p.total,
         accept_ranges: p.accept_ranges,
@@ -1463,7 +1527,11 @@ pub(crate) fn probe_fallback_plan(range_error: Option<u16>) -> Option<ProbeFallb
 /// viewer links serve HTML legitimately and are direct-only anyway, so
 /// they fail elsewhere; a `.zip` task getting HTML is the gated one-shot
 /// zip expiring/missing cookies.
-fn drive_signin_error(task: &DownloadTask, final_url: &str, content_type: Option<&str>) -> Option<String> {
+fn drive_signin_error(
+    task: &DownloadTask,
+    final_url: &str,
+    content_type: Option<&str>,
+) -> Option<String> {
     if !is_drive_url(&task.url) {
         return None;
     }
@@ -1501,7 +1569,10 @@ pub(crate) fn is_zip_family_name(name: &str) -> bool {
     ZIP_EXTS.contains(&ext.as_str())
 }
 
-fn probe_from_plain_response(resp: reqwest::Response, task: &DownloadTask) -> Result<Probe, String> {
+fn probe_from_plain_response(
+    resp: reqwest::Response,
+    task: &DownloadTask,
+) -> Result<Probe, String> {
     if let Some(e) = drive_signin_error(
         task,
         resp.url().as_ref(),
@@ -1587,7 +1658,8 @@ pub(crate) enum RangeResponseAction {
 /// response falls back; network errors remain errors. The caller keeps the
 /// plain response body and streams it without a second body request.
 pub async fn probe(client: &reqwest::Client, task: &DownloadTask) -> Result<Probe, String> {
-    let range_result = send_with_cookie_redirects(client, task, &task.url, Some((0, Some(0)))).await;
+    let range_result =
+        send_with_cookie_redirects(client, task, &task.url, Some((0, Some(0)))).await;
     let resp = match range_result {
         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => resp,
         Ok(resp) => {
@@ -1713,7 +1785,8 @@ fn save_state_with_key(
         .filter(|s| !s.merged)
         .map(|s| serde_json::json!({"start":s.start,"end":s.end,"done":s.done}))
         .collect();
-    let j = serde_json::json!({"url":url,"state_key":state_key,"etag":etag,"total":total,"segments":v});
+    let j =
+        serde_json::json!({"url":url,"state_key":state_key,"etag":etag,"total":total,"segments":v});
     // Atomic: tmp + rename, serialized. Torn state.json = resume lost.
     let _g = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dst = state_path_for(part_dir);
@@ -1727,7 +1800,13 @@ fn save_state_with_key(
 /// matches `key` (both non-empty), else by URL equality. The
 /// `state_key` path lets expiring ticket URLs rotate without losing
 /// parts; the URL fallback keeps legacy states resumable.
-pub(crate) fn state_matches(saved_url: Option<&str>, saved_key: Option<&str>, fetch_url: &str, task_url: &str, key: &str) -> bool {
+pub(crate) fn state_matches(
+    saved_url: Option<&str>,
+    saved_key: Option<&str>,
+    fetch_url: &str,
+    task_url: &str,
+    key: &str,
+) -> bool {
     if !key.is_empty() && saved_key == Some(key) {
         return true;
     }
@@ -1763,10 +1842,9 @@ pub async fn download_http_with_prewarm(
         // Server answered a Range request with 200 after claiming ranges
         // in the probe. Parts are unusable; restart once as single-stream.
         ctrl.ranges_ignored.store(false, Ordering::Relaxed);
-        let _ = tokio::fs::remove_dir_all(
-            task.dest_dir.join(format!(".downloadcraft-{}", task.id)),
-        )
-        .await;
+        let _ =
+            tokio::fs::remove_dir_all(task.dest_dir.join(format!(".downloadcraft-{}", task.id)))
+                .await;
         ctrl.downloaded.store(0, Ordering::Relaxed);
         ctrl.total.store(0, Ordering::Relaxed);
         if let Ok(mut parts) = ctrl.parts.lock() {
@@ -2040,8 +2118,7 @@ async fn download_http_inner(
                         .unwrap_or_else(|e| e.into_inner())
                         .as_deref()
                         .unwrap_or(""),
-                )
-                    && v.get("total").and_then(|t| t.as_u64()) == Some(total)
+                ) && v.get("total").and_then(|t| t.as_u64()) == Some(total)
                     && etag_ok
                 {
                     if let Some(arr) = v.get("segments").and_then(|s| s.as_array()) {
@@ -3849,12 +3926,13 @@ mod tests {
         b.username = "u".into();
         b.password = "p".into();
         assert!(headers_for_target(&b, "https://a.example/x").contains_key("authorization"));
-        assert!(
-            !headers_for_target(&b, "https://b.example/x").contains_key("authorization")
-        );
+        assert!(!headers_for_target(&b, "https://b.example/x").contains_key("authorization"));
         // auth_allowed is strict same-origin, no Drive exception.
         assert!(auth_allowed_for_target(&t, "https://cdn.example.com/f.zip"));
-        assert!(!auth_allowed_for_target(&t, "https://takeout.example/f.zip"));
+        assert!(!auth_allowed_for_target(
+            &t,
+            "https://takeout.example/f.zip"
+        ));
     }
 
     #[test]
@@ -3937,7 +4015,13 @@ mod tests {
             Some("https://accounts.google.com/Continue?x=1".into())
         );
         // Hop cap fails hard instead of looping forever.
-        assert!(redirect_next_url(302, "https://ex.com/b", "https://ex.com/a", REDIRECT_HOP_LIMIT).is_err());
+        assert!(redirect_next_url(
+            302,
+            "https://ex.com/b",
+            "https://ex.com/a",
+            REDIRECT_HOP_LIMIT
+        )
+        .is_err());
         // Non-HTTP scheme is refused.
         assert!(redirect_next_url(302, "ftp://ex.com/f", "https://ex.com/a", 0).is_err());
 
@@ -3949,7 +4033,10 @@ mod tests {
         ));
         assert!(!needs_cookie_redirect("https://example.com/f.zip", &plain));
         let cookie_row = task_with_headers(&[("Cookie", "a=b")]);
-        assert!(needs_cookie_redirect("https://example.com/f.zip", &cookie_row));
+        assert!(needs_cookie_redirect(
+            "https://example.com/f.zip",
+            &cookie_row
+        ));
 
         // Sign-in page detection: Drive zip task ending on accounts HTML.
         assert!(is_drive_signin_page(
@@ -4169,23 +4256,29 @@ mod tests {
         );
         assert_eq!(probe_fallback_plan(Some(416)), None);
         assert_eq!(probe_fallback_plan(None), None);
-        assert_eq!(check_plain_complete(5, Some(10)), Err("incomplete download: got 5 of 10 bytes".into()));
+        assert_eq!(
+            check_plain_complete(5, Some(10)),
+            Err("incomplete download: got 5 of 10 bytes".into())
+        );
         assert!(check_plain_complete(10, Some(10)).is_ok());
         assert!(check_plain_complete(0, None).is_ok());
         assert_eq!(
             range_response_action(200, false),
             RangeResponseAction::RangesIgnored
         );
+        assert_eq!(range_response_action(200, true), RangeResponseAction::Error);
         assert_eq!(
-            range_response_action(200, true),
-            RangeResponseAction::Error
+            range_response_action(206, false),
+            RangeResponseAction::Range
         );
-        assert_eq!(range_response_action(206, false), RangeResponseAction::Range);
         assert_eq!(
             range_response_action(429, false),
             RangeResponseAction::Throttled
         );
-        assert_eq!(range_response_action(403, false), RangeResponseAction::Error);
+        assert_eq!(
+            range_response_action(403, false),
+            RangeResponseAction::Error
+        );
     }
 
     #[test]
