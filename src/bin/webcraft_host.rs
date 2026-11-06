@@ -104,9 +104,8 @@ fn app_running() -> bool {
             if n <= 0 {
                 return false;
             }
-            let path = std::path::PathBuf::from(
-                String::from_utf8_lossy(&buf[..n as usize]).to_string(),
-            );
+            let path =
+                std::path::PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).to_string());
             let is_gui = path
                 .file_name()
                 .map(|n| n == std::ffi::OsStr::new("webcraft"))

@@ -609,6 +609,17 @@ fn process_alive(pid: u32) -> bool {
 fn pid_is_same_image(pid: u32) -> bool {
     #[cfg(windows)]
     {
+        // Same binary's basename (portable/renamed copies still match
+        // themselves, mirroring the unix branches); tasklist reports the
+        // image name, which for the standard install is webcraft.exe.
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "webcraft.exe".to_string());
         let mut tcmd = std::process::Command::new("tasklist");
         tcmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
         platform::no_window(&mut tcmd);
@@ -618,7 +629,7 @@ fn pid_is_same_image(pid: u32) -> bool {
         let txt = String::from_utf8_lossy(&out.stdout);
         // CSV row: "webcraft.exe","1234","Console",... — match the quoted image
         // name so pids belonging to lookalike processes never match.
-        txt.to_lowercase().contains("\"webcraft.exe\"")
+        txt.to_lowercase().contains(&format!("\"{own}\""))
     }
     #[cfg(unix)]
     {
