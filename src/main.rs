@@ -610,26 +610,46 @@ fn pid_is_same_image(pid: u32) -> bool {
     #[cfg(windows)]
     {
         // Same binary's basename (portable/renamed copies still match
-        // themselves, mirroring the unix branches); tasklist reports the
-        // image name, which for the standard install is webcraft.exe.
+        // themselves, mirroring the unix branches). Win32 query, not tasklist:
+        // tasklist CSV is OEM-codepage encoded and would mangle non-ASCII
+        // image names (from_utf8_lossy would never match them).
+        type Handle = *mut core::ffi::c_void;
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+            fn CloseHandle(h: Handle) -> i32;
+            fn QueryFullProcessImageNameW(
+                h: Handle,
+                flags: u32,
+                buf: *mut u16,
+                size: *mut u32,
+            ) -> i32;
+        }
+        let h = unsafe { OpenProcess(0x1000, 0, pid) }; // PROCESS_QUERY_LIMITED_INFORMATION
+        if h.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) } != 0;
+        unsafe { CloseHandle(h) };
+        if !ok {
+            return false;
+        }
+        let image = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
         let own = std::env::current_exe()
             .ok()
-            .and_then(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_else(|| "webcraft.exe".to_string());
-        let mut tcmd = std::process::Command::new("tasklist");
-        tcmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
-        platform::no_window(&mut tcmd);
-        let Ok(out) = tcmd.output() else {
-            return false;
-        };
-        let txt = String::from_utf8_lossy(&out.stdout);
-        // CSV row: "webcraft.exe","1234","Console",... — match the quoted image
-        // name so pids belonging to lookalike processes never match.
-        txt.to_lowercase().contains(&format!("\"{own}\""))
+            .and_then(|p| p.file_name().map(|n| n.to_owned()));
+        match own {
+            Some(own) => image
+                .file_name()
+                .map(|n| n.eq_ignore_ascii_case(&own))
+                .unwrap_or(false),
+            // current_exe unavailable: fall back to the standard image name.
+            None => image
+                .file_name()
+                .map(|n| n.eq_ignore_ascii_case(std::ffi::OsStr::new("webcraft.exe")))
+                .unwrap_or(false),
+        }
     }
     #[cfg(unix)]
     {
