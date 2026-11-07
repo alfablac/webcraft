@@ -17,9 +17,11 @@ fn browser_resume_dir() -> PathBuf {
     config_dir().join("browser-resume")
 }
 
-/// Live GUI instance? Mirrors app's single-instance check: lock pid alive.
-/// Host is same-OS standalone binary, so liveness check duplicates per-OS
-/// (app's `process_alive` lives in GUI binary, not a shared lib).
+/// Live GUI instance? Mirrors app's single-instance check: lock pid alive AND
+/// that pid is actually a webcraft image (PIDs are reused; a stale lock could
+/// otherwise collide with an unrelated process). Host is same-OS standalone
+/// binary, so liveness check duplicates per-OS (app's `process_alive` lives in
+/// GUI binary, not a shared lib).
 fn app_running() -> bool {
     let Ok(txt) = std::fs::read_to_string(config_dir().join("instance.lock")) else {
         return false;
@@ -37,6 +39,12 @@ fn app_running() -> bool {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
             fn GetExitCodeProcess(h: Handle, code: *mut u32) -> i32;
             fn CloseHandle(h: Handle) -> i32;
+            fn QueryFullProcessImageNameW(
+                h: Handle,
+                flags: u32,
+                buf: *mut u16,
+                size: *mut u32,
+            ) -> i32;
         }
         let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
         if h.is_null() {
@@ -44,8 +52,18 @@ fn app_running() -> bool {
         }
         let mut code = 0u32;
         let ok = GetExitCodeProcess(h, &mut code);
+        let mut alive = ok != 0 && code == 259; // STILL_ACTIVE
+        if alive {
+            // PID reuse guard: image must actually be the GUI exe.
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            alive = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0
+                && String::from_utf16_lossy(&buf[..len as usize])
+                    .to_lowercase()
+                    .ends_with("\\webcraft.exe");
+        }
         CloseHandle(h);
-        ok != 0 && code == 259 // STILL_ACTIVE
+        alive
     }
     #[cfg(unix)]
     unsafe {
@@ -57,7 +75,46 @@ fn app_running() -> bool {
             // kill(pid,0) succeeds for zombies too; app exits fully on quit,
             // and launch is de-duped by app's own single-instance forward.
         }
-        kill(pid as i32, 0) == 0
+        if kill(pid as i32, 0) != 0 {
+            return false;
+        }
+        // PID reuse guard: the pid must actually be the GUI image.
+        // /proc/<pid>/exe on Linux, proc_pidpath on macOS (no /proc there);
+        // other unix: no image source, keep liveness-only behavior.
+        #[cfg(target_os = "linux")]
+        {
+            let is_gui = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n == std::ffi::OsStr::new("webcraft"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !is_gui {
+                return false;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn proc_pidpath(pid: i32, buf: *mut u8, size: u32) -> i32;
+            }
+            let mut buf = [0u8; 4096]; // PROC_PIDPATHINFO_MAXSIZE
+            let n = proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32);
+            if n <= 0 {
+                return false;
+            }
+            let path =
+                std::path::PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).to_string());
+            let is_gui = path
+                .file_name()
+                .map(|n| n == std::ffi::OsStr::new("webcraft"))
+                .unwrap_or(false);
+            if !is_gui {
+                return false;
+            }
+        }
+        true
     }
     #[cfg(not(any(windows, unix)))]
     false

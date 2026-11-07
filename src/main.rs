@@ -397,7 +397,7 @@ fn main() {
         let lock = platform::config_dir().join("instance.lock");
         if let Ok(txt) = std::fs::read_to_string(&lock) {
             if let Ok(pid) = txt.trim().parse::<u32>() {
-                if pid != std::process::id() && process_alive(pid) {
+                if pid != std::process::id() && process_alive(pid) && pid_is_same_image(pid) {
                     for a in &args[1..] {
                         if a.starts_with("http://")
                             || a.starts_with("https://")
@@ -594,6 +594,101 @@ fn process_alive(pid: u32) -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// True when `pid` belongs to a process running this same executable image.
+/// Guards against stale lock files after reboot/crash: PIDs get reused, and a
+/// bare liveness check can then collide with an unrelated process (e.g. Steam
+/// holding the pid a previous webcraft instance wrote before exiting).
+fn pid_is_same_image(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // Same binary's basename (portable/renamed copies still match
+        // themselves, mirroring the unix branches). Win32 query, not tasklist:
+        // tasklist CSV is OEM-codepage encoded and would mangle non-ASCII
+        // image names (from_utf8_lossy would never match them).
+        type Handle = *mut core::ffi::c_void;
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+            fn CloseHandle(h: Handle) -> i32;
+            fn QueryFullProcessImageNameW(
+                h: Handle,
+                flags: u32,
+                buf: *mut u16,
+                size: *mut u32,
+            ) -> i32;
+        }
+        let h = unsafe { OpenProcess(0x1000, 0, pid) }; // PROCESS_QUERY_LIMITED_INFORMATION
+        if h.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) } != 0;
+        unsafe { CloseHandle(h) };
+        if !ok {
+            return false;
+        }
+        let image = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_owned()));
+        match own {
+            Some(own) => image
+                .file_name()
+                .map(|n| n.eq_ignore_ascii_case(&own))
+                .unwrap_or(false),
+            // current_exe unavailable: fall back to the standard image name.
+            None => image
+                .file_name()
+                .map(|n| n.eq_ignore_ascii_case(std::ffi::OsStr::new("webcraft.exe")))
+                .unwrap_or(false),
+        }
+    }
+    #[cfg(unix)]
+    {
+        // /proc/<pid>/exe on Linux; proc_pidpath on macOS (no /proc there).
+        // Compare against this binary's basename (portable/renamed copies
+        // still match themselves).
+        #[cfg(target_os = "linux")]
+        {
+            let own = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_owned()))
+                .unwrap_or_default();
+            return std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|p| p.file_name().map(|n| n == own).unwrap_or(false))
+                .unwrap_or(false);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn proc_pidpath(pid: i32, buf: *mut u8, size: u32) -> i32;
+            }
+            let mut buf = [0u8; 4096]; // PROC_PIDPATHINFO_MAXSIZE
+            let n = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
+            if n <= 0 {
+                return false;
+            }
+            let path =
+                std::path::PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).to_string());
+            let own = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_owned()))
+                .unwrap_or_default();
+            return path.file_name().map(|n| n == own).unwrap_or(false);
+        }
+        #[allow(unreachable_code)]
+        {
+            // Other unix: no image source available; liveness-only behavior.
+            true
+        }
     }
     #[cfg(not(any(windows, unix)))]
     {
