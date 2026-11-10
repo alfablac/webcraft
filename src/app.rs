@@ -5580,10 +5580,7 @@ fn col_resize_handles(
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
         ui.painter().line_segment(
-            [
-                egui::pos2(x, header.min.y + 3.0),
-                egui::pos2(x, header.max.y - 3.0),
-            ],
+            [egui::pos2(x, header.min.y), egui::pos2(x, header.max.y)],
             egui::Stroke::new(
                 if active { 2.0f32 } else { 1.0 },
                 if active {
@@ -5689,7 +5686,34 @@ fn cell_align<R>(
     };
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(layout));
     child.set_width(inner.width());
+    child.set_clip_rect(ui.clip_rect().intersect(inner));
     add(&mut child)
+}
+
+fn download_progress(ui: &mut egui::Ui, fraction: Option<f32>, hover: &str) {
+    let text = fraction.map_or_else(|| "?".into(), |f| format!("{:.1}%", f * 100.0));
+    let text = egui::RichText::new(text).color(theme::TEXT_MUTED).small();
+    let text_width = egui::WidgetText::from(text.clone())
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+        .size()
+        .x;
+    let bar_width =
+        (ui.available_width() - ui.spacing().item_spacing.x - text_width).clamp(0.0, 72.0);
+    ui.add(
+        egui::ProgressBar::new(fraction.unwrap_or(0.0))
+            .desired_width(bar_width)
+            .desired_height(6.0)
+            .rounding(egui::Rounding::same(3.0))
+            .fill(theme::PRIMARY),
+    )
+    .on_hover_text(hover);
+    ui.add(egui::Label::new(text).truncate().selectable(false))
+        .on_hover_text(hover);
 }
 
 /// Form constant: DragValue width (labels: `ui::LABEL_W`).
@@ -7038,9 +7062,12 @@ impl DownloadApp {
         // Outer vertical scroll wraps inner horizontal scroll (wide user widths scroll sideways, header+rows together).
         egui::ScrollArea::vertical().id_salt("dl_outer").auto_shrink([false, false]).show(ui, |ui| {
         egui::ScrollArea::horizontal().id_salt("dl_h").auto_shrink([false, false]).show(ui, |ui| {
+        // Sheet rows have a fixed pitch; toolbar spacing/height must not leak in.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.spacing_mut().interact_size.y = ROW_H;
         let avail = ui.available_width().max(200.0);
         let stored = if compact_table { self.dl_widths_compact.as_deref() } else { self.dl_widths.as_deref() };
-        let mut cols = dl_cols(avail, compact_table, stored);
+        let cols = dl_cols(avail, compact_table, stored);
         // Header: flat sheet row + resize handles (handles overlay, after cells so drag wins over sort click at boundary).
         let (hdr_rect, _) = ui.allocate_exact_size(egui::vec2(cols.iter().sum::<f32>() + COL_GAP * (cols.len() - 1) as f32, ROW_H + 2.0), egui::Sense::hover());
         sheet_header(ui, hdr_rect);
@@ -7052,7 +7079,7 @@ impl DownloadApp {
                 for (i, (h, sc)) in if compact_table { vec![("File Name", Some(0u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Progress", Some(6u8)), ("", None)] } else { vec![("File Name", Some(0u8)), ("Q", Some(1u8)), ("Size", Some(2u8)), ("Status", Some(3u8)), ("Time left", Some(4u8)), ("Rate", Some(5u8)), ("Progress", Some(6u8)), ("Resumable", Some(7u8)), ("", None)] }.iter().enumerate() {
                     let arrow = if Some(self.sort_col) == *sc { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
                     let hdr = |ui: &mut egui::Ui, f: &dyn Fn(&mut egui::Ui) -> bool| -> bool {
-                        if matches!(i, 2 | 4 | 5) { cell_r(ui, cols[i], |ui| f(ui)) } else { cell(ui, cols[i], |ui| f(ui)) }
+                        if matches!(sc, Some(2 | 4 | 5)) { cell_r(ui, cols[i], |ui| f(ui)) } else { cell(ui, cols[i], |ui| f(ui)) }
                     };
                     let clicked = match sc {
                         Some(_) => hdr(ui, &|ui| ui.add(egui::Label::new(theme::table_header_text(&format!("{h}{arrow}"))).truncate().selectable(false).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()),
@@ -7065,8 +7092,11 @@ impl DownloadApp {
                 }
             });
         }
-        if col_resize_handles(ui, hdr_rect, &mut cols, compact_table) {
-            if compact_table { self.dl_widths_compact = Some(cols.clone()); } else { self.dl_widths = Some(cols.clone()); }
+        // Apply new widths next frame so this frame's header and rows agree.
+        let mut resized_cols = cols.clone();
+        if col_resize_handles(ui, hdr_rect, &mut resized_cols, compact_table) {
+            if compact_table { self.dl_widths_compact = Some(resized_cols); } else { self.dl_widths = Some(resized_cols); }
+            ui.ctx().request_repaint();
         }
 
         if tasks.is_empty() {
@@ -7107,6 +7137,10 @@ impl DownloadApp {
                 let row_w = cols.iter().sum::<f32>() + COL_GAP * (cols.len() - 1) as f32;
                 let (row_rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H + 2.0), egui::Sense::click());
                 sheet_row(ui, row_rect, sel, row_idx, row_idx + 1 == n_tasks, resp.hovered());
+                for boundary in col_bounds(&cols) {
+                    let x = row_rect.left() + boundary;
+                    ui.painter().line_segment([egui::pos2(x, row_rect.top()), egui::pos2(x, row_rect.bottom())], egui::Stroke::new(1.0_f32, theme::BORDER));
+                }
                 let mut c = ui.new_child(egui::UiBuilder::new().max_rect(row_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
                 {
                     let ui = &mut c;
@@ -7129,11 +7163,7 @@ impl DownloadApp {
                         let frac_opt = display_fraction(&t, seg_view);
                         let frac = frac_opt.unwrap_or(0.0);
                         let hover = format!("{}{}", if frac_opt.is_some() { format!("{:.1}% · ", frac * 100.0) } else { String::new() }, if t.total.is_some() { format!("{} of {}", fmt_bytes(t.downloaded), t.total.map(fmt_bytes).unwrap_or_else(|| "?".into())) } else if let Some(v) = seg_view.filter(|v| v.manifest) { format!("{} | {}", fmt_bytes(t.downloaded), v.label()) } else { format!("{} of ?", fmt_bytes(t.downloaded)) });
-                        let w = nw(); cell(ui, w, |ui| {
-                            let bar = egui::ProgressBar::new(frac).desired_width(72.0).desired_height(6.0).rounding(egui::Rounding::same(3.0)).fill(theme::PRIMARY);
-                            ui.add(bar).on_hover_text(&hover);
-                            ui.add(egui::Label::new(egui::RichText::new(if frac_opt.is_some() { format!("{:.1}%", frac * 100.0) } else { "?".into() }).color(theme::TEXT_MUTED).small()).truncate().selectable(false)).on_hover_text(&hover);
-                        });
+                        let w = nw(); cell(ui, w, |ui| download_progress(ui, frac_opt, &hover));
                         if !compact_table {
                             let w = nw(); cell(ui, w, |ui| {
                                 if resume_capable(&t) {
@@ -14082,6 +14112,70 @@ mod progress_tests {
         assert_eq!(ch.quality_height, Some(1080));
         st.quality = "bogus".into();
         assert_eq!(yt_choice_from_state(&st).quality_height, None);
+    }
+
+    #[test]
+    fn download_table_cell_alignment() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.spacing_mut().interact_size.y = ROW_H;
+                ui.spacing_mut().item_spacing = egui::vec2(COL_GAP, 0.0);
+                for compact in [false, true] {
+                    let cols = dl_cols(if compact { 680.0 } else { 1240.0 }, compact, None);
+                    let width = cols.iter().sum::<f32>() + COL_GAP * (cols.len() - 1) as f32;
+                    let mut starts = Vec::new();
+                    for header in [true, false] {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, ROW_H + 2.0),
+                            egui::Sense::hover(),
+                        );
+                        let mut row = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        row.horizontal(|ui| {
+                            for (i, &w) in cols.iter().enumerate() {
+                                cell(ui, w, |ui| {
+                                    if header {
+                                        starts.push(ui.max_rect().left());
+                                        ui.label("Header");
+                                    } else {
+                                        assert_eq!(ui.max_rect().left(), starts[i]);
+                                        assert!(ui.max_rect().contains_rect(ui.clip_rect()));
+                                        if i == if compact { 3 } else { 6 } {
+                                            let content_rect = ui.max_rect();
+                                            download_progress(ui, Some(1.0), "100%");
+                                            assert!(
+                                                ui.min_rect().right() <= content_rect.right() + 0.5
+                                            );
+                                            assert!(
+                                                (ui.min_rect().center().y - rect.center().y).abs()
+                                                    <= 0.5
+                                            );
+                                        } else {
+                                            ui.add(
+                                                egui::Label::new("Long filename or status")
+                                                    .truncate(),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        for (i, boundary) in col_bounds(&cols).iter().enumerate() {
+                            assert!(
+                                (rect.left() + boundary + COL_GAP / 2.0 + 8.0 - starts[i + 1])
+                                    .abs()
+                                    <= 0.5
+                            );
+                        }
+                    }
+                }
+            });
+        });
     }
 
     #[test]

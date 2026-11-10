@@ -712,15 +712,24 @@ impl Crawler {
             if !self.project.cookies.trim().is_empty() && url.host_str() == start.host_str() {
                 page_req = page_req.header(reqwest::header::COOKIE, self.project.cookies.trim());
             }
-            let resp = match page_req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    if is_start {
-                        return Err(format!("start page request failed: {e}"));
+            let resp =
+                match tokio::time::timeout(std::time::Duration::from_secs(30), page_req.send())
+                    .await
+                {
+                    Err(_) => {
+                        if is_start {
+                            return Err("start page request timed out".into());
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        if is_start {
+                            return Err(format!("start page request failed: {e}"));
+                        }
+                        continue;
+                    }
+                };
             if !resp.status().is_success() {
                 if is_start {
                     return Err(format!("start page returned HTTP {}", resp.status()));
@@ -740,12 +749,21 @@ impl Crawler {
                 .get(reqwest::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok());
-            let is_html = ct.contains("html");
+            let attachment = resp
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("attachment")
+                });
+            let is_html = ct.to_ascii_lowercase().contains("html") && !attachment;
             if !is_html {
-                if is_start {
-                    return Err(format!("start page did not return HTML ({ct})"));
-                }
-                // Linked resource with no usable extension: IDM-style discovery by response type.
+                // A short URL (including the start URL) can redirect straight to a file.
+                // Inspect headers only; dropping the response avoids consuming its body.
                 let canon = canonicalize(&url);
                 let ext = ext_of(&canon);
                 if !ext.is_empty()
@@ -759,6 +777,9 @@ impl Crawler {
                     continue;
                 }
                 if !path_allowed(&self.project, &canon) {
+                    continue;
+                }
+                if exclude_re.as_ref().is_some_and(|re| re.is_match(&canon)) {
                     continue;
                 }
                 if !self.project.include_regex.is_empty() {
@@ -1298,6 +1319,119 @@ pub fn rewrite_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn short_url_redirects_to_file_without_reading_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or("");
+                let response = match path {
+                    "/kppc" => "HTTP/1.1 302 Found\r\nLocation: /opaque\r\nContent-Length: 0\r\n\r\n",
+                    "/opaque" => "HTTP/1.1 302 Found\r\nLocation: /payload.exe\r\nContent-Length: 0\r\n\r\n",
+                    "/payload.exe" => "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 12\r\n\r\n",
+                    "/attachment" => "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Disposition: Attachment; filename=report.html\r\nContent-Length: 12\r\n\r\n",
+                    _ => panic!("unexpected request: {request}"),
+                };
+                // Deliberately omit the advertised body: metadata discovery must not read it.
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let project = GrabberProject {
+            start_url: format!("{base}/kppc"),
+            max_pages: 10,
+            ..Default::default()
+        };
+        let crawl = |project| {
+            let client = client.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    Crawler {
+                        project,
+                        progress: None,
+                    }
+                    .crawl(&client),
+                )
+                .await
+                .expect("crawl stalled reading a file body")
+                .unwrap()
+            }
+        };
+        let (pages, files) = crawl(project.clone()).await;
+        assert!(pages.is_empty());
+        assert_eq!(
+            files,
+            vec![FoundFile {
+                url: format!("{base}/payload.exe"),
+                size: Some(12),
+                mime: "application/octet-stream".into(),
+                page_url: String::new(),
+                selected: true,
+            }]
+        );
+        for filtered in [
+            GrabberProject {
+                extensions: vec!["pdf".into()],
+                ..project.clone()
+            },
+            GrabberProject {
+                exclude_regex: "payload".into(),
+                ..project.clone()
+            },
+            GrabberProject {
+                include_regex: "report".into(),
+                ..project.clone()
+            },
+            GrabberProject {
+                exclude_paths: vec!["payload".into()],
+                ..project.clone()
+            },
+            GrabberProject {
+                mime_allow: vec!["application/pdf".into()],
+                ..project.clone()
+            },
+            GrabberProject {
+                max_size: 10,
+                ..project.clone()
+            },
+            GrabberProject {
+                min_size: 20,
+                ..project.clone()
+            },
+            GrabberProject {
+                max_total_bytes: 10,
+                ..project.clone()
+            },
+        ] {
+            assert!(crawl(filtered).await.1.is_empty());
+        }
+        let (pages, files) = crawl(GrabberProject {
+            start_url: format!("{base}/attachment"),
+            ..project
+        })
+        .await;
+        assert!(pages.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].url, format!("{base}/attachment"));
+        server.abort();
+    }
+
     #[test]
     fn sharepoint_detection_and_rest_shapes() {
         let u = Url::parse("https://stievano-my.sharepoint.com/personal/yatogam1_stievano_onmicrosoft_com/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fyatogam1%5Fstievano%5Fonmicrosoft%5Fcom%2FDocuments%2FAnimes%2FDragon%20Ball%20Super&ga=1").unwrap();

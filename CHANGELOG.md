@@ -2,6 +2,12 @@
 
 All notable changes to webcraft. Versions follow the app version in Cargo.toml.
 
+## [0.28.0] - 2026-11-09
+
+### Fixed
+
+- Redirector crawling and main-window progress alignment.
+
 ## [0.27.0] - 2026-11-04
 
 ### Added
